@@ -17,7 +17,7 @@ test('release notes from the changelog', () => {
   // The real changelog has notes for the app's version.
   const version = JSON.parse(readFileSync(new URL('../../../src-tauri/tauri.conf.json', import.meta.url))).version;
   const real = releaseNotes(readFileSync(new URL('../../../CHANGELOG.md', import.meta.url), 'utf8'), version);
-  assert.ok(real && real.groups.length >= 3, 'CHANGELOG.md has a section for the current version');
+  assert.ok(real && (real.intro || real.groups.some((group) => group.items.length)), 'CHANGELOG.md has notes for the current version');
 });
 
 test('milestones: quiet the first time, then the biggest new one of each kind', () => {

@@ -3,6 +3,11 @@
 The desktop app has its own version, separate from the `jetstream` Python package.
 Each release's notes come from its section here (`## 0.2.0`, ...).
 
+## 0.2.1
+
+### Catalogs
+- Keep large catalog group lists compact and scrollable, so dataset details and export options are easier to reach.
+
 ## 0.2.0
 
 The first release of the new desktop app: synced folders, a cloud file manager and a faster
