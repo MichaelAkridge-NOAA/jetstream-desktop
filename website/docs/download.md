@@ -1,6 +1,6 @@
 # Download and install
 
-Published builds are available from the [desktop releases page](https://github.com/MichaelAkridge-NOAA/jetstream-desktop/releases). Tagged builds first create a draft release, which is not available until a maintainer publishes it.
+Published builds are available from the [desktop releases page](https://github.com/MichaelAkridge-NOAA/jetstream-desktop/releases). New versions built on `main` and manually tagged builds first create a draft release, which is not available until a maintainer publishes it.
 When available, development builds can also be downloaded from [GitHub Actions](https://github.com/MichaelAkridge-NOAA/jetstream-desktop/actions/workflows/desktop.yml) (open a successful run and scroll to **Artifacts**). Windows and Linux portable builds have separate `-portable` artifacts; installers are in `-installers` artifacts. GitHub wraps each artifact in a ZIP, so unzip the artifact first to reach the portable ZIP.
 
 ## Windows

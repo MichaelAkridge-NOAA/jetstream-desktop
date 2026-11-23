@@ -13,7 +13,7 @@ python desktop/scripts/build_desktop.py           # installers + portable zip, f
 python desktop/scripts/build_desktop.py --portable-only
 ```
 
-Changes to app files build Windows, macOS and Linux on GitHub Actions; tags like `desktop-v0.2.1` make a draft release with notes from `desktop/CHANGELOG.md`. A maintainer must publish the draft as a stable release for the app's update check to see it. Keep the latest stable release a desktop release tagged `desktop-v*`. The macOS DMG targets the runner's native architecture; it is not a universal build.
+Changes to app files build Windows, macOS and Linux on GitHub Actions. After all builds on `main` succeed, a new version with notes in `desktop/CHANGELOG.md` gets a draft release and a `desktop-v*` tag. Existing tags and releases are left unchanged; same-version builds are not automatically republished. Tags pushed manually also trigger draft-release builds. A maintainer must publish the draft as a stable release for the app's update check to see it. Keep the latest stable release a desktop release tagged `desktop-v*`. The macOS DMG targets the runner's native architecture; it is not a universal build.
 
 The update check uses GitHub's unauthenticated latest-release API. It cannot see a private repository or draft and prerelease builds; the repository and a stable desktop release must be publicly accessible before updates can be discovered. The original repository owns standalone Python package publishing.
 

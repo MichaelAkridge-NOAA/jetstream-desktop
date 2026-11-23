@@ -4,7 +4,7 @@ name: Build desktop app (Windows, macOS and Linux)
 # setup .exe installers), macOS (a .dmg), and Linux (a portable .zip plus .AppImage and .deb),
 # each uploaded as a workflow artifact. It runs on pushes
 # that change the app (any branch), by hand from the Actions tab, and on tags like
-# desktop-v0.2.0, which also create a draft release with everything attached.
+# desktop-v0.2.0. Successful main builds for a new version also create a draft release.
 #
 # Versions: the desktop app has its own version (desktop/src-tauri/tauri.conf.json; change it
 # with desktop/scripts/set_version.py), separate from the Python package. Every build also
@@ -154,3 +154,50 @@ jobs:
           tag_name: ${{ github.ref_name }}
           draft: true
           files: desktop/release/*-portable.zip
+
+  draft-release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    concurrency:
+      group: desktop-draft-release-main
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(python desktop/scripts/set_version.py --show)
+          tag="desktop-v${version}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          existing=$(git ls-remote --tags origin "refs/tags/$tag")
+          releases=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq '.[].tag_name')
+          if [ -n "$existing" ] || printf '%s\n' "$releases" | grep -Fxq "$tag"; then
+            echo "Tag or release $tag already exists; leaving it unchanged."
+            echo "create=false" >> "$GITHUB_OUTPUT"
+          else
+            python desktop/scripts/release_notes.py "$tag" -o release-notes.md
+            echo "create=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download build artifacts
+        if: steps.release.outputs.create == 'true'
+        uses: actions/download-artifact@v5
+        with:
+          pattern: jetstream-desktop-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create draft release
+        if: steps.release.outputs.create == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: gh release create "$RELEASE_TAG" release-assets/* --draft --target "$GITHUB_SHA" --title "JetStream Desktop $RELEASE_TAG" --notes-file release-notes.md
