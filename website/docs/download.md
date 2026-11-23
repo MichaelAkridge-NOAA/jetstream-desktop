@@ -7,7 +7,9 @@ When available, development builds can also be downloaded from [GitHub Actions](
 
 === "Portable (recommended)"
 
-    `JetStream-<version>-build<number>-windows-x64-portable.zip`
+    [Download the Windows portable ZIP from Releases](https://github.com/MichaelAkridge-NOAA/jetstream-desktop/releases)
+
+    If no release is published yet, use the Windows portable artifact from a successful [Actions run](https://github.com/MichaelAkridge-NOAA/jetstream-desktop/actions/workflows/desktop.yml).
 
     1. Unzip it anywhere: your Documents folder, a shared drive, or a USB stick.
     2. Run **JetStream.exe**. Nothing is installed, and no administrator rights are needed.
@@ -16,7 +18,7 @@ When available, development builds can also be downloaded from [GitHub Actions](
 
 === "Installer"
 
-    `JetStream_<version>_x64-setup.exe` or `JetStream_<version>_x64_en-US.msi`
+    [Download a Windows installer from Releases](https://github.com/MichaelAkridge-NOAA/jetstream-desktop/releases) or use the Windows installers artifact from a successful [Actions run](https://github.com/MichaelAkridge-NOAA/jetstream-desktop/actions/workflows/desktop.yml).
 
     Adds JetStream to the Start menu. Data is kept in `%LOCALAPPDATA%\JetStream`.
 
@@ -28,7 +30,7 @@ Windows 10 and 11 include the WebView2 runtime JetStream needs.
 
 ## macOS
 
-1. Download the macOS `.dmg` from a published release or a successful Actions build. Check that the build's architecture matches your Mac; CI builds for the runner's native architecture, not a universal binary.
+1. Download the macOS `.dmg` from [Releases](https://github.com/MichaelAkridge-NOAA/jetstream-desktop/releases) or a successful [Actions run](https://github.com/MichaelAkridge-NOAA/jetstream-desktop/actions/workflows/desktop.yml). Check that the build's architecture matches your Mac; CI builds for the runner's native architecture, not a universal binary.
 2. Open the disk image and drag **JetStream** to **Applications**.
 3. Open JetStream from Applications. Its data is kept in `~/Library/Application Support/JetStream`.
 
@@ -41,6 +43,8 @@ Apps opened from Finder may not inherit your shell's `PATH`. Install the Google 
 
 === ".deb (Debian, Ubuntu)"
 
+    [Download the Linux .deb from Releases](https://github.com/MichaelAkridge-NOAA/jetstream-desktop/releases) or use the Linux installers artifact from a successful [Actions run](https://github.com/MichaelAkridge-NOAA/jetstream-desktop/actions/workflows/desktop.yml).
+
     ```bash
     sudo apt install ./JetStream_<version>_amd64.deb
     ```
@@ -49,6 +53,8 @@ Apps opened from Finder may not inherit your shell's `PATH`. Install the Google 
 
 === "AppImage (most distributions)"
 
+    [Download the Linux AppImage from Releases](https://github.com/MichaelAkridge-NOAA/jetstream-desktop/releases) or use the Linux installers artifact from a successful [Actions run](https://github.com/MichaelAkridge-NOAA/jetstream-desktop/actions/workflows/desktop.yml).
+
     ```bash
     chmod +x JetStream_<version>_amd64.AppImage
     ./JetStream_<version>_amd64.AppImage
@@ -56,7 +62,7 @@ Apps opened from Finder may not inherit your shell's `PATH`. Install the Google 
 
 === "Portable zip"
 
-    `JetStream-<version>-build<number>-linux-x64-portable.zip`: unzip and run `./JetStream`.
+    [Download the Linux portable ZIP from Releases](https://github.com/MichaelAkridge-NOAA/jetstream-desktop/releases) or use the Linux portable artifact from a successful [Actions run](https://github.com/MichaelAkridge-NOAA/jetstream-desktop/actions/workflows/desktop.yml). Unzip it and run `./JetStream`.
     Needs WebKitGTK 4.1 (`sudo apt install libwebkit2gtk-4.1-0` on Ubuntu and Debian).
 
 The tray icon needs a desktop with AppIndicator support (on GNOME, the AppIndicator extension).
