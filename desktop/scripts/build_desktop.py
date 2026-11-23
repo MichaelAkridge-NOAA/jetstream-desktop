@@ -10,8 +10,8 @@ Needs Python 3.10+, Rust (stable), Node 22, and on Windows the WebView2 runtime
 
 Portable package: JetStream.exe (or JetStream on Linux), the upload engine, the JetStream
 server (as a folder, server/, when built with build_sidecar.py --portable; otherwise one
-program) and an empty JetStreamData folder. CI builds are named with their build number
-(JetStream-0.2.0-build18-windows-x64-portable.zip); release tags use the plain version. Unzip anywhere and run; job history and logs stay in
+program) and an empty JetStreamData folder. CI builds, including release tags, are named with
+their build number (JetStream-0.2.0-build18-windows-x64-portable.zip). Unzip anywhere and run; job history and logs stay in
 JetStreamData next to the program, separate from the normal per-user data folder used
 by an installed copy and the pip version.
 """
@@ -85,10 +85,9 @@ def build(args) -> None:
 
 
 def build_label() -> str:
-    """"0.2.0-build18" for CI builds, "0.2.0" for release tags and local builds."""
+    """"0.2.0-build18" for CI builds, "0.2.0" for local builds."""
     build = os.environ.get("JETSTREAM_BUILD", "").strip()
-    tagged = os.environ.get("GITHUB_REF", "").startswith("refs/tags/")
-    return f"{version()}-build{build}" if build and not tagged else version()
+    return f"{version()}-build{build}" if build else version()
 
 
 def version_text() -> str:

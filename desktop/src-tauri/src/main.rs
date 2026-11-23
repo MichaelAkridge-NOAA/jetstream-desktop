@@ -140,7 +140,8 @@ fn app_info(app: AppHandle) -> AppInfo {
 #[tauri::command]
 async fn check_update(app: AppHandle) -> Option<jetstream_transfer::update::UpdateInfo> {
     let current = app.package_info().version.to_string();
-    jetstream_transfer::update::check(&current, None).await.ok().flatten()
+    let build = portable_data_dir().and_then(|_| jetstream_transfer::BUILD_NUMBER.parse().ok());
+    jetstream_transfer::update::check_with_build(&current, build, None).await.ok().flatten()
 }
 
 /// Current server status, polled by the UI on load (events cover later changes).

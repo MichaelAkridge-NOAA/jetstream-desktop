@@ -275,7 +275,7 @@ class AppState {
 
   /** Hide the sidebar notice for this version (Settings still shows it). */
   dismissUpdate() {
-    if (this.update) this.savePrefs({ update_dismissed: this.update.latest });
+    if (this.update) this.savePrefs({ update_dismissed: this.update.build ? `${this.update.latest}-build${this.update.build}` : this.update.latest });
   }
 
   async refreshJobs() {

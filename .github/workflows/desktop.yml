@@ -1,8 +1,8 @@
-name: Build desktop app (Windows and Linux)
+name: Build desktop app (Windows, macOS and Linux)
 
 # Builds JetStream Desktop for Windows (the portable .zip, the main download, plus the .msi and
-# setup .exe installers) and Linux (a portable .zip plus .AppImage and .deb), each uploaded as a
-# workflow artifact. It runs on pushes
+# setup .exe installers), macOS (a .dmg), and Linux (a portable .zip plus .AppImage and .deb),
+# each uploaded as a workflow artifact. It runs on pushes
 # that change the app (any branch), by hand from the Actions tab, and on tags like
 # desktop-v0.2.0, which also create a draft release with everything attached.
 #
@@ -12,7 +12,6 @@ name: Build desktop app (Windows and Linux)
 # app and in the portable zip's name: JetStream-0.2.0-build18-windows-x64-portable.zip.
 #
 # Linux builds on ubuntu-22.04 so the AppImage also runs on older distributions.
-# The macOS build is in desktop-mac-linux.yml (run by hand for now).
 # To build locally instead: desktop/scripts/build_windows.ps1 or desktop/scripts/build_desktop.py.
 on:
   workflow_dispatch:
@@ -42,6 +41,7 @@ jobs:
       matrix:
         include:
           - platform: windows-latest
+          - platform: macos-latest
           - platform: ubuntu-22.04
     runs-on: ${{ matrix.platform }}
     permissions:
@@ -86,7 +86,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
-          python desktop/scripts/build_sidecar.py --portable
+          python desktop/scripts/build_sidecar.py ${{ runner.os != 'macOS' && '--portable' || '' }}
 
       - name: Build JetStream upload engine
         run: python desktop/scripts/build_engine.py
@@ -127,18 +127,28 @@ jobs:
       - name: Package portable build and collect installers
         # JetStream-<version>-build<N>-<windows|linux>-x64-portable.zip (unzip and run, no
         # install; the server is a folder inside it) plus the installers: .msi and setup .exe on
-        # Windows, .AppImage and .deb on Linux.
+        # Windows, .dmg on macOS, and .AppImage and .deb on Linux.
         run: python desktop/scripts/build_desktop.py --package-only
 
-      - name: Upload build
+      - name: Upload installers
         uses: actions/upload-artifact@v5
         with:
-          name: jetstream-desktop-${{ matrix.platform }}
-          path: desktop/release/*
+          name: jetstream-desktop-${{ matrix.platform }}-installers
+          path: |
+            desktop/release/*
+            !desktop/release/*-portable.zip
+          if-no-files-found: error
+
+      - name: Upload portable build
+        if: runner.os != 'macOS'
+        uses: actions/upload-artifact@v5
+        with:
+          name: jetstream-desktop-${{ matrix.platform }}-portable
+          path: desktop/release/*-portable.zip
           if-no-files-found: error
 
       - name: Attach portable build to the draft release
-        if: startsWith(github.ref, 'refs/tags/desktop-v')
+        if: startsWith(github.ref, 'refs/tags/desktop-v') && runner.os != 'macOS'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}

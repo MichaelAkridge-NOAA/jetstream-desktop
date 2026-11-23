@@ -21,13 +21,17 @@ The standalone web version (`pip install` and `jetstream` in a browser) is descr
 **From GitHub Actions** (when artifacts are available for a successful build):
 1. Open the repository's **Actions** tab, then the **Build desktop app** workflow.
 2. Open the latest green run and scroll to **Artifacts**.
-3. Download the artifact for your system:
-   - `jetstream-desktop-windows-latest`: the portable zip, an `.msi` installer and a setup `.exe`
-   - `jetstream-desktop-ubuntu-22.04`: a portable zip, an `.AppImage` and a `.deb` (Linux)
-   - `jetstream-desktop-macos-latest`: a `.dmg` (only when the macOS workflow is run by hand)
-4. Unzip the artifact you downloaded (GitHub wraps every artifact in a zip).
+3. Download the artifact for your system and preferred package:
+  - `jetstream-desktop-windows-latest-portable`: the portable ZIP
+  - `jetstream-desktop-windows-latest-installers`: an `.msi` and a setup `.exe`
+  - `jetstream-desktop-ubuntu-22.04-portable`: the Linux portable ZIP
+  - `jetstream-desktop-ubuntu-22.04-installers`: an `.AppImage` and a `.deb`
+  - `jetstream-desktop-macos-latest-installers`: a macOS `.dmg` for the runner's architecture
+4. Unzip the artifact you downloaded (GitHub wraps every artifact in a ZIP). A portable artifact contains the portable ZIP, which you then unzip to run the app.
 
 **Updates:** once a day the app asks GitHub for the latest desktop release and, if it's newer, says so at the bottom of the sidebar and in **Settings → About** with a link to download it. Nothing is downloaded or installed on its own; turn the check off in **Settings → About**. To move a portable copy to a new version, unzip the new one and move the `JetStreamData` folder into it.
+
+Windows and Linux portable copies with a known build number can also see a newer build of the same version when its matching portable ZIP is attached to a published release. Actions artifacts alone are not checked. Installed and macOS copies are notified about newer versions only; local builds without a build number cannot compare builds.
 
 The update check is unauthenticated, so it cannot see releases in a private repository. A stable desktop release must be publicly accessible for the check to work.
 
@@ -35,7 +39,7 @@ Older builds check the previous repository and may not see releases here. Downlo
 
 **Installer or portable?**
 - **Installer** (`.msi` / setup `.exe`): adds JetStream to the Start menu and keeps data in your user profile (`%LOCALAPPDATA%\JetStream`).
-- **Portable** (`JetStream-<version>-windows-x64-portable.zip`):
+- **Portable** (`JetStream-<version>-build<number>-windows-x64-portable.zip`):
   - Unzip it anywhere, including a USB drive, and run `JetStream.exe`. Nothing is installed.
   - Job history, logs and the upload manifest stay in the `JetStreamData` folder next to the program.
   - It does not use the installed copy's history while this data folder is present.
@@ -43,8 +47,10 @@ Older builds check the previous repository and may not see releases here. Downlo
 **On Linux:**
 - **`.deb`** (Debian, Ubuntu 22.04 and newer): `sudo apt install ./JetStream_<version>_amd64.deb` installs it with what it needs (WebKitGTK 4.1).
 - **`.AppImage`** (most distributions): `chmod +x JetStream_<version>_amd64.AppImage`, then run it.
-- **Portable zip** (`JetStream-<version>-linux-x64-portable.zip`): unzip and run `./JetStream`. It needs WebKitGTK 4.1 installed (`libwebkit2gtk-4.1-0` on Ubuntu/Debian).
+- **Portable zip** (`JetStream-<version>-build<number>-linux-x64-portable.zip`): unzip and run `./JetStream`. It needs WebKitGTK 4.1 installed (`libwebkit2gtk-4.1-0` on Ubuntu/Debian).
 - The tray icon needs a desktop with AppIndicator support (GNOME needs the AppIndicator extension).
+
+**On macOS:** open the `.dmg` and drag JetStream to Applications. Check the build's architecture against your Mac; the CI build uses the runner's native architecture. The build is unsigned and not notarized, so macOS Gatekeeper may block it. See the [macOS download instructions](../website/docs/download.md#macos).
 
 **First run:**
 - Windows warns about unsigned apps. Choose **More info → Run anyway**.
@@ -188,7 +194,7 @@ Older builds check the previous repository and may not see releases here. Downlo
   - closing the window keeps JetStream running in the tray, so uploads continue; **Quit** in the tray menu stops it
   - opening the app again brings the running window to the front
 - **Installers:** an `.msi` or `.exe` on Windows, a `.dmg` on macOS, and an `.AppImage` or `.deb` on Linux.
-- **Portable Windows build:** `JetStream-<version>-windows-x64-portable.zip`. Unzip it anywhere (including a USB drive) and run `JetStream.exe`; nothing is installed. Job history, logs and the upload manifest stay in the `JetStreamData` folder next to the program. Needs the WebView2 runtime, which comes with Windows 10 and 11.
+- **Portable Windows build:** `JetStream-<version>-build<number>-windows-x64-portable.zip`. Unzip it anywhere (including a USB drive) and run `JetStream.exe`; nothing is installed. Job history, logs and the upload manifest stay in the `JetStreamData` folder next to the program. Needs the WebView2 runtime, which comes with Windows 10 and 11.
 
 ## Requirements for users
 
@@ -317,10 +323,10 @@ python scripts/build_desktop.py --package-only   # adds the portable zip; copies
 - **Icons:** regenerate them from `jetstream/static/icon.png` with `npm run icons`.
 - **Releasing:** add a `## <version>` section to `CHANGELOG.md`, set the version with `set_version.py`, push, then tag: `git tag desktop-v0.2.1 && git push origin desktop-v0.2.1`. When the build finishes, publish the draft release.
 - **Versions:** the desktop app (with its upload engine) has its own version, separate from the `jetstream` Python package. It lives in `src-tauri/tauri.conf.json`. Change it everywhere with `python desktop/scripts/set_version.py 0.2.1`; `--check` confirms the files agree. Every CI build also carries its build number and commit. They show in the sidebar ("v0.2.0 · build 18"), in **Settings → About** (desktop app, upload engine and server versions), in `jetstream-transfer --version`, and in the portable zip's name. Local builds say "local build".
-- **CI:** the **Build desktop app (Windows and Linux)** GitHub workflow (`.github/workflows/desktop.yml`) builds both on every push that changes the app:
+- **CI:** the **Build desktop app (Windows, macOS and Linux)** GitHub workflow (`.github/workflows/desktop.yml`) builds all three on every push that changes the app:
   - It runs on any push that changes `desktop/`, `jetstream/` or `requirements.txt` (README-only changes are skipped), when started from the Actions tab, or when a `desktop-v*` tag is pushed.
-  - Each run uploads `jetstream-desktop-windows-latest` (portable zip, `.msi`, setup `.exe`) and `jetstream-desktop-ubuntu-22.04` (portable zip, `.AppImage`, `.deb`). Download them from the run's summary page. Linux builds on Ubuntu 22.04 so the AppImage runs on older distributions too.
+  - Each run uploads separate portable and installer artifacts for Windows and Linux, plus a macOS installer artifact. Download them from the run's summary page. Linux builds on Ubuntu 22.04 so the AppImage runs on older distributions too.
   - A tag such as `desktop-v0.2.0` (which must match the desktop version) also creates a draft release with the installers and portable zip attached. Its description is that version's section of [CHANGELOG.md](CHANGELOG.md) (`scripts/release_notes.py`); the build fails if the section is missing. Publish the draft to make it the "latest" release the app's update check sees.
-  - The macOS build is parked in **Build desktop app (macOS)** (`.github/workflows/desktop-mac-linux.yml`), which only runs when started from the Actions tab.
+  - **Build desktop app (macOS)** (`.github/workflows/desktop-mac-linux.yml`) remains available as a separate manual build.
   - The **Run workflow** button only appears once the workflow file is on the default branch.
 - **Code signing:** Windows SmartScreen and macOS Gatekeeper warn about unsigned apps. Signing needs certificates that are not set up yet. See the [Tauri signing guides](https://tauri.app/distribute/).

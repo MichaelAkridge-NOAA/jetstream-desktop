@@ -6,7 +6,7 @@ JetStream Desktop moves research data from your computer or network share to Goo
 
 ## Get started
 
-1. Download a Windows or Linux build from the [desktop releases](https://github.com/MichaelAkridge-NOAA/jetstream-desktop/releases), when available. Builds may also be available as [GitHub Actions artifacts](https://github.com/MichaelAkridge-NOAA/jetstream-desktop/actions/workflows/desktop.yml). Tagged builds create draft releases until a maintainer publishes them.
+1. Download a Windows, macOS or Linux build from the [desktop releases](https://github.com/MichaelAkridge-NOAA/jetstream-desktop/releases), when available. Builds may also be available as [GitHub Actions artifacts](https://github.com/MichaelAkridge-NOAA/jetstream-desktop/actions/workflows/desktop.yml). Tagged builds create draft releases until a maintainer publishes them.
 2. Install or unzip the app. See [download and install](website/docs/download.md) for platform requirements and unsigned-build warnings.
 3. Install the [Google Cloud SDK](https://cloud.google.com/sdk/docs/install), open JetStream, and sign in with an account that can access your bucket.
 4. Add a folder, preview the changes, and upload. Follow the [first upload guide](website/docs/getting-started.md) for details.
@@ -16,7 +16,7 @@ JetStream Desktop moves research data from your computer or network share to Goo
 - Sync folders on demand or on a schedule, with preview, pause and resume.
 - Browse and manage cloud storage, compare folders, and create catalogs.
 - Review activity, upload progress and checksum verification receipts.
-- Use a Windows or Linux installer or a portable build with its own data folder.
+- Use a Windows, macOS or Linux installer, or a Windows or Linux portable build with its own data folder.
 
 ## Help and development
 

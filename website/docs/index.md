@@ -11,6 +11,7 @@ hide:
 <p class="tagline">JetStream moves research data from your computer and network shares to Google Cloud Storage, keeps it in sync, and proves every file arrived intact.</p>
 
 [Download for Windows](download.md#windows){ .md-button .md-button--primary }
+[Download for macOS](download.md#macos){ .md-button }
 [Download for Linux](download.md#linux){ .md-button }
 [Get started](getting-started.md){ .md-button }
 
@@ -108,5 +109,5 @@ hide:
 
 - **Your own Google sign-in.** No service account keys to manage; JetStream uses the account you sign in with.
 - **Nothing leaves your control.** Data goes only to your buckets. The only other request JetStream makes is a daily check for a newer version, which you can turn off.
-- **Works where you work.** Windows (installer or portable, no admin rights needed) and Linux. Network shares, OneDrive folders and USB drives.
+- **Works where you work.** Windows, macOS and Linux. Network shares, OneDrive folders and USB drives.
 - **Open source.** [See the code on GitHub](https://github.com/MichaelAkridge-NOAA/jetstream-desktop).

@@ -17,6 +17,7 @@ def load(name):
 
 
 release_notes = load("release_notes")
+build_desktop = load("build_desktop")
 
 SAMPLE = """# Changes
 
@@ -53,3 +54,14 @@ def test_current_version_has_notes():
     version = json.loads((DESKTOP / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))["version"]
     notes = release_notes.notes_for((DESKTOP / "CHANGELOG.md").read_text(encoding="utf-8"), version)
     assert notes.strip()
+
+
+def test_portable_build_label_includes_release_build_number(monkeypatch):
+    monkeypatch.setattr(build_desktop, "version", lambda: "0.2.1")
+    monkeypatch.setenv("JETSTREAM_BUILD", "30")
+    monkeypatch.setenv("GITHUB_REF", "refs/tags/desktop-v0.2.1")
+    assert build_desktop.build_label() == "0.2.1-build30"
+    monkeypatch.setenv("GITHUB_REF", "refs/heads/main")
+    assert build_desktop.build_label() == "0.2.1-build30"
+    monkeypatch.delenv("JETSTREAM_BUILD")
+    assert build_desktop.build_label() == "0.2.1"

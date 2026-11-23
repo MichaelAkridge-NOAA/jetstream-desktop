@@ -334,7 +334,7 @@
         <div class="updates">
           {#if app.update}
             <p class="update-line">
-              <strong>JetStream {app.update.latest} is available.</strong>
+              <strong>JetStream {app.update.latest}{app.update.build ? ` build ${app.update.build}` : ''} is available.</strong>
               {app.desktop?.portable ? 'Unzip the new portable version, then move the JetStreamData folder from this copy into it to keep your job history.' : 'Download and run the new installer.'}
             </p>
             <div class="btn-row">
@@ -351,8 +351,8 @@
           </div>
           <label class="row toggle">
             <span>
-              <span class="label">Check for new versions</span>
-              <small class="muted">Once a day, asks GitHub for the latest JetStream Desktop release. Nothing is downloaded or installed on its own.</small>
+              <span class="label">Check for updates</span>
+              <small class="muted">Once a day, checks GitHub for the latest published release or portable build. Nothing is downloaded or installed on its own.</small>
             </span>
             <input type="checkbox" checked={app.prefs.update_check} onchange={(e) => setUpdateCheck(e.currentTarget.checked)} />
           </label>

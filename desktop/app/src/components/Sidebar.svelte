@@ -48,7 +48,7 @@
   ];
 
   const mod = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent) ? '⌘' : 'Ctrl';
-  let showUpdate = $derived(app.update && app.prefs.update_dismissed !== app.update.latest);
+  let showUpdate = $derived(app.update && app.prefs.update_dismissed !== (app.update.build ? `${app.update.latest}-build${app.update.build}` : app.update.latest));
   let auth = $derived(app.auth);
   let authState = $derived(
     !auth ? 'unknown' : auth.gcloud_account && auth.adc_available ? 'ok' : auth.signed_in ? 'partial' : 'none',
@@ -103,9 +103,9 @@
       <div class="update">
         <button class="update-open" onclick={() => openUrl(app.update.url)} title="Open the release page to download it">
           <ArrowUpCircle size={16} />
-          <span>JetStream {app.update.latest} is available</span>
+          <span>JetStream {app.update.latest}{app.update.build ? ` build ${app.update.build}` : ''} is available</span>
         </button>
-        <button class="update-x" aria-label="Hide until the next version" title="Hide until the next version" onclick={() => app.dismissUpdate()}><X size={14} /></button>
+        <button class="update-x" aria-label="Hide until the next update" title="Hide until the next update" onclick={() => app.dismissUpdate()}><X size={14} /></button>
       </div>
     {/if}
     <button class="account" onclick={() => (app.view = 'settings')} title="Google Cloud sign-in">

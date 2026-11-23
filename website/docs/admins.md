@@ -2,7 +2,7 @@
 
 ## What JetStream is
 
-A desktop app (Windows, Linux) for uploading folders to Google Cloud Storage and managing buckets. It's made of:
+A desktop app (Windows, macOS, Linux) for uploading folders to Google Cloud Storage and managing buckets. It's made of:
 
 - the app window (Tauri / WebView2 on Windows, WebKitGTK on Linux)
 - the **JetStream engine**, a Rust program that does uploads, browsing and verification
@@ -12,9 +12,10 @@ A desktop app (Windows, Linux) for uploading folders to Google Cloud Storage and
 
 - **Portable zip:** no installation and no administrator rights; everything stays in the folder, including its data (`JetStreamData`).
 - **Windows installer:** per-user (`.exe`) or per-machine (`.msi`). Data in `%LOCALAPPDATA%\JetStream`.
+- **macOS:** `.dmg` containing the app. Data in `~/Library/Application Support/JetStream`.
 - **Linux:** `.deb`, AppImage, or portable zip. Data in `~/.local/share/jetstream`.
 
-Builds aren't code-signed yet, so SmartScreen warns about them.
+Builds aren't code-signed yet, so Windows SmartScreen and macOS Gatekeeper may warn about them.
 
 ## Sign-in and credentials
 

@@ -1,13 +1,13 @@
 # Download and install
 
 Published builds are available from the [desktop releases page](https://github.com/MichaelAkridge-NOAA/jetstream-desktop/releases). Tagged builds first create a draft release, which is not available until a maintainer publishes it.
-When available, development builds can also be downloaded from [GitHub Actions](https://github.com/MichaelAkridge-NOAA/jetstream-desktop/actions/workflows/desktop.yml) (open a successful run and scroll to **Artifacts**).
+When available, development builds can also be downloaded from [GitHub Actions](https://github.com/MichaelAkridge-NOAA/jetstream-desktop/actions/workflows/desktop.yml) (open a successful run and scroll to **Artifacts**). Windows and Linux portable builds have separate `-portable` artifacts; installers are in `-installers` artifacts. GitHub wraps each artifact in a ZIP, so unzip the artifact first to reach the portable ZIP.
 
 ## Windows
 
 === "Portable (recommended)"
 
-    `JetStream-<version>-windows-x64-portable.zip`
+    `JetStream-<version>-build<number>-windows-x64-portable.zip`
 
     1. Unzip it anywhere: your Documents folder, a shared drive, or a USB stick.
     2. Run **JetStream.exe**. Nothing is installed, and no administrator rights are needed.
@@ -25,6 +25,17 @@ When available, development builds can also be downloaded from [GitHub Actions](
     Choose **More info → Run anyway**. Signing is planned.
 
 Windows 10 and 11 include the WebView2 runtime JetStream needs.
+
+## macOS
+
+1. Download the macOS `.dmg` from a published release or a successful Actions build. Check that the build's architecture matches your Mac; CI builds for the runner's native architecture, not a universal binary.
+2. Open the disk image and drag **JetStream** to **Applications**.
+3. Open JetStream from Applications. Its data is kept in `~/Library/Application Support/JetStream`.
+
+!!! note "macOS security warning"
+    The build is unsigned and not notarized, so Gatekeeper may block it. Only proceed if you trust the source: after attempting to open JetStream, check **System Settings → Privacy & Security** for **Open Anyway**.
+
+Apps opened from Finder may not inherit your shell's `PATH`. Install the Google Cloud SDK in a standard location such as `/usr/local/bin` or Homebrew, or start JetStream from a terminal with `open -a JetStream`.
 
 ## Linux
 
@@ -45,7 +56,7 @@ Windows 10 and 11 include the WebView2 runtime JetStream needs.
 
 === "Portable zip"
 
-    `JetStream-<version>-linux-x64-portable.zip`: unzip and run `./JetStream`.
+    `JetStream-<version>-build<number>-linux-x64-portable.zip`: unzip and run `./JetStream`.
     Needs WebKitGTK 4.1 (`sudo apt install libwebkit2gtk-4.1-0` on Ubuntu and Debian).
 
 The tray icon needs a desktop with AppIndicator support (on GNOME, the AppIndicator extension).
@@ -59,11 +70,14 @@ The tray icon needs a desktop with AppIndicator support (on GNOME, the AppIndica
 
 JetStream checks once a day for a newer release and says so at the bottom of the sidebar and in **Settings → About**, with links to download it. Nothing is downloaded or installed on its own.
 
+Windows and Linux portable copies with a known build number can also be offered a newer build of the same version when the matching ZIP is attached to a published release. Development builds in Actions are not checked. Installed and macOS copies are notified about newer versions only.
+
 This check is unauthenticated and cannot see releases in a private repository. It requires a publicly accessible, published desktop release.
 
 Older builds check the previous repository and may not see releases here. Download a newer build from the desktop releases page manually to move to the new update channel.
 
 - **Installer:** run the new installer.
+- **macOS:** open the new disk image and replace JetStream in Applications.
 - **Portable:** unzip the new version, then move the **JetStreamData** folder from the old copy into it to keep your history.
 
 Back up your data before updating. Drafts and prereleases do not appear in the app's update check.

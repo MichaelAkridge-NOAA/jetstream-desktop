@@ -1,8 +1,6 @@
 name: Build desktop app (macOS)
 
-# The macOS (.dmg) build of JetStream Desktop. Parked for now: Windows and Linux build on every
-# push (desktop.yml). Run this by hand from the Actions tab ("Run workflow") when a macOS build
-# is wanted; to build it automatically, add macos-latest to desktop.yml's matrix instead.
+# An optional manual macOS (.dmg) build. The main desktop.yml workflow also builds macOS.
 on:
   workflow_dispatch:
 

@@ -15,6 +15,7 @@ const NOTES_LIMIT: usize = 4000;
 pub struct UpdateInfo {
     /// The newer version ("0.2.1").
     pub latest: String,
+    pub build: Option<u64>,
     /// Its release page.
     pub url: String,
     /// Its release notes (Markdown, shortened).
@@ -52,12 +53,29 @@ const PLATFORM: &str = if cfg!(windows) {
     "linux"
 };
 
+const ARCH: &str = if cfg!(target_arch = "x86_64") {
+    "x64"
+} else if cfg!(target_arch = "aarch64") {
+    "arm64"
+} else {
+    std::env::consts::ARCH
+};
+
 /// The portable zip for `platform` (a release has one per platform), if there is one.
-fn portable_asset(assets: &[Asset], platform: &str) -> Option<String> {
+fn portable_asset(assets: &[Asset], version: &str, platform: &str, arch: &str) -> Option<String> {
     assets
         .iter()
-        .find(|a| a.name.ends_with("-portable.zip") && a.name.contains(&format!("-{platform}-")))
+        .find(|a| a.name.starts_with(&format!("JetStream-{version}-")) && a.name.ends_with(&format!("-{platform}-{arch}-portable.zip")))
         .map(|a| a.browser_download_url.clone())
+}
+
+fn portable_build_asset<'a>(assets: &'a [Asset], version: &str, platform: &str, arch: &str) -> Option<(u64, &'a str)> {
+    let prefix = format!("JetStream-{version}-build");
+    let suffix = format!("-{platform}-{arch}-portable.zip");
+    assets.iter().filter_map(|asset| {
+        let build = asset.name.strip_prefix(prefix.as_str())?.strip_suffix(suffix.as_str())?.parse::<u64>().ok()?;
+        (build > 0).then_some((build, asset.browser_download_url.as_str()))
+    }).max_by_key(|(build, _)| *build)
 }
 
 /// "desktop-v0.2.1", "v0.2.1" or "0.2.1" as numbers; None for anything else.
@@ -71,14 +89,27 @@ pub fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
 
 /// The update offered by a release JSON, if it's a desktop release newer than `current`.
 pub fn newer_than(current: &str, release_json: &str) -> Option<UpdateInfo> {
+    newer_than_with_build(current, None, release_json)
+}
+
+pub fn newer_than_with_build(current: &str, current_build: Option<u64>, release_json: &str) -> Option<UpdateInfo> {
     let release: Release = serde_json::from_str(release_json).ok()?;
     if release.draft || release.prerelease || !release.tag_name.starts_with(TAG_PREFIX) {
         return None;
     }
     let latest = parse_version(&release.tag_name)?;
-    if latest <= parse_version(current)? {
+    let current_version = parse_version(current)?;
+    if latest < current_version {
         return None;
     }
+    let version = format!("{}.{}.{}", latest.0, latest.1, latest.2);
+    let portable = portable_build_asset(&release.assets, &version, PLATFORM, ARCH);
+    let build = if latest == current_version {
+        let installed = current_build.filter(|build| *build > 0)?;
+        Some(portable.filter(|(build, _)| *build > installed)?.0)
+    } else {
+        None
+    };
     let mut notes = release.body.unwrap_or_default();
     if notes.len() > NOTES_LIMIT {
         let mut cut = NOTES_LIMIT;
@@ -88,13 +119,17 @@ pub fn newer_than(current: &str, release_json: &str) -> Option<UpdateInfo> {
         notes.truncate(cut);
         notes.push('…');
     }
-    let download = portable_asset(&release.assets, PLATFORM);
-    Some(UpdateInfo { latest: format!("{}.{}.{}", latest.0, latest.1, latest.2), url: release.html_url, notes, download })
+    let download = portable.map(|(_, url)| url.to_string()).or_else(|| portable_asset(&release.assets, &version, PLATFORM, ARCH));
+    Some(UpdateInfo { latest: version, build, url: release.html_url, notes, download })
 }
 
 /// Ask GitHub whether a newer version than `current` is out. Ok(None): up to date, or no
 /// desktop release is published. Errors (offline, rate limited) are for the caller to ignore.
 pub async fn check(current: &str, url: Option<&str>) -> Result<Option<UpdateInfo>> {
+    check_with_build(current, None, url).await
+}
+
+pub async fn check_with_build(current: &str, current_build: Option<u64>, url: Option<&str>) -> Result<Option<UpdateInfo>> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .user_agent(format!("JetStream-Desktop/{current}"))
@@ -108,7 +143,7 @@ pub async fn check(current: &str, url: Option<&str>) -> Result<Option<UpdateInfo
         return Ok(None); // nothing published yet (or the repository isn't public)
     }
     let text = response.error_for_status()?.text().await?;
-    Ok(newer_than(current, &text))
+    Ok(newer_than_with_build(current, current_build, &text))
 }
 
 #[cfg(test)]
@@ -152,7 +187,7 @@ mod tests {
         assert_eq!(update.url, "https://github.com/MichaelAkridge-NOAA/jetstream-desktop/releases/tag/desktop-v0.2.1");
         assert_eq!(update.notes, "## Notes");
         // Each platform links its own portable zip, whatever order the release lists them in.
-        let expected = if cfg!(windows) { Some("https://example.com/portable.zip") } else if cfg!(target_os = "macos") { None } else { Some("https://example.com/linux.zip") };
+        let expected = if ARCH != "x64" || cfg!(target_os = "macos") { None } else if cfg!(windows) { Some("https://example.com/portable.zip") } else { Some("https://example.com/linux.zip") };
         assert_eq!(update.download.as_deref(), expected);
         assert!(newer_than("0.2.1", &release("desktop-v0.2.1", false, false)).is_none(), "same version");
         assert!(newer_than("0.3.0", &release("desktop-v0.2.1", false, false)).is_none(), "older");
@@ -170,9 +205,30 @@ mod tests {
             {"name": "JetStream-0.2.1-build30-windows-x64-portable.zip", "browser_download_url": "W"}
         ]))
         .unwrap();
-        assert_eq!(portable_asset(&assets, "windows").as_deref(), Some("W"));
-        assert_eq!(portable_asset(&assets, "linux").as_deref(), Some("L"));
-        assert_eq!(portable_asset(&assets, "macos"), None);
+        assert_eq!(portable_asset(&assets, "0.2.1", "windows", "x64").as_deref(), Some("W"));
+        assert_eq!(portable_asset(&assets, "0.2.1", "linux", "x64").as_deref(), Some("L"));
+        assert_eq!(portable_asset(&assets, "0.2.1", "windows", "arm64"), None);
+        assert_eq!(portable_asset(&assets, "0.2.1", "macos", "x64"), None);
+        assert_eq!(portable_asset(&assets, "0.2.2", "windows", "x64"), None);
+    }
+
+    #[test]
+    fn offers_only_newer_matching_portable_builds() {
+        let release = serde_json::json!({
+            "tag_name": "desktop-v0.2.1",
+            "html_url": "https://example.com/release",
+            "assets": [
+                {"name": format!("JetStream-0.2.1-build31-{PLATFORM}-{ARCH}-portable.zip"), "browser_download_url": "https://example.com/31.zip"},
+                {"name": format!("JetStream-0.2.1-build32-{PLATFORM}-other-portable.zip"), "browser_download_url": "https://example.com/other.zip"},
+                {"name": format!("JetStream-0.2.1-build30-{PLATFORM}-{ARCH}-portable.zip"), "browser_download_url": "https://example.com/30.zip"}
+            ]
+        }).to_string();
+        let update = newer_than_with_build("0.2.1", Some(30), &release).unwrap();
+        assert_eq!(update.build, Some(31));
+        assert_eq!(update.download.as_deref(), Some("https://example.com/31.zip"));
+        assert!(newer_than_with_build("0.2.1", Some(31), &release).is_none());
+        assert!(newer_than_with_build("0.2.1", None, &release).is_none());
+        assert!(newer_than_with_build("0.2.2", Some(1), &release).is_none());
     }
 
     #[tokio::test]
