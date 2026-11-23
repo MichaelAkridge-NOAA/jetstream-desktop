@@ -1,0 +1,113 @@
+"""Settings and configuration management."""
+
+from fastapi import APIRouter, Request
+from pydantic import BaseModel
+from typing import Optional
+import os
+import subprocess
+
+router = APIRouter()
+
+class SettingsResponse(BaseModel):
+    """Response model for settings."""
+    gcs_authenticated: bool
+    auth_method: Optional[str]
+    gcloud_account: Optional[str]
+    gdrive_router_available: bool
+    gdrive_router_error: Optional[str]
+    gdrive_client_configured: bool
+
+
+@router.get("/", response_model=SettingsResponse)
+async def get_settings(request: Request):
+    """Get current settings and check ADC authentication status."""
+    from ..config import settings
+
+    authenticated = False
+    auth_method = None
+    gcloud_account = None
+
+    # Check if ADC credentials are configured using a LOCAL-ONLY check.
+    # Deliberately avoid storage.Client() here.
+    #
+    # storage.Client() is safe when the local ADC access token is fresh (reads
+    # from disk, no network needed).  But when the token is EXPIRED it calls
+    # oauth2.googleapis.com to refresh — that outbound HTTPS request can be
+    # blocked indefinitely by corporate firewalls/proxies, causing the API
+    # endpoint to hang, the browser to give up, and "NetworkError" to appear.
+    #
+    # google.auth.default() only inspects local credential files / env vars and
+    # never attempts a token refresh, so it is always safe regardless of network
+    # conditions or token freshness.
+    try:
+        import google.auth
+        import google.auth.exceptions
+
+        # google.auth.default() reads the local ADC file / env vars only.
+        # It does NOT make any network calls, so it is safe behind firewalls.
+        credentials, _project = google.auth.default()
+        authenticated = True
+
+        # Determine auth method
+        if os.environ.get('GOOGLE_APPLICATION_CREDENTIALS'):
+            auth_method = "Service Account (GOOGLE_APPLICATION_CREDENTIALS)"
+        else:
+            auth_method = "User Credentials (gcloud ADC)"
+            # Try to get gcloud account info (quick subprocess, 5 s timeout)
+            try:
+                result = subprocess.run(
+                    ['gcloud', 'auth', 'list', '--filter=status:ACTIVE', '--format=value(account)'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    gcloud_account = result.stdout.strip()
+            except Exception:
+                pass
+    except Exception:
+        authenticated = False
+
+    return SettingsResponse(
+        gcs_authenticated=authenticated,
+        auth_method=auth_method,
+        gcloud_account=gcloud_account,
+        gdrive_router_available=bool(getattr(request.app.state, "gdrive_router_available", False)),
+        gdrive_router_error=getattr(request.app.state, "gdrive_router_import_error", None),
+        gdrive_client_configured=bool(settings.GDRIVE_CLIENT_ID and settings.GDRIVE_CLIENT_SECRET),
+    )
+
+
+class TransferSettings(BaseModel):
+    """Upload speed limit in megabits per second (0 = no limit). Applies to the JetStream
+    engine and to transfers in the desktop app; gcloud uploads aren't limited."""
+    max_mbps: float = 0.0
+    #: Uploads (e.g. subfolders of a split upload) running at once, 1–4.
+    parallel_jobs: Optional[int] = None
+    #: Large files as parallel parts (JetStream engine); applies to uploads that start later.
+    parallel_parts: Optional[bool] = None
+
+
+@router.get("/transfer")
+async def get_transfer_settings() -> dict:
+    from ..transfer_settings import load
+
+    return load()
+
+
+@router.put("/transfer")
+async def put_transfer_settings(body: TransferSettings) -> dict:
+    from ..services import upload_service
+    from ..transfer_settings import save
+
+    from ..services import queue_manager
+    from .uploads import start_queued_jobs
+
+    changes = {"max_mbps": max(0.0, body.max_mbps)}
+    if body.parallel_jobs is not None:
+        changes["parallel_jobs"] = body.parallel_jobs
+    if body.parallel_parts is not None:
+        changes["parallel_parts"] = body.parallel_parts
+    saved = save(changes)
+    saved["applied_to_running"] = upload_service.apply_speed_limit(saved["max_mbps"])
+    queue_manager.max_concurrent = saved["parallel_jobs"]
+    start_queued_jobs()
+    return saved

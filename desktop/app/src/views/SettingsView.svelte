@@ -1,0 +1,632 @@
+<script>
+  import LogIn from '@lucide/svelte/icons/log-in';
+  import RefreshCw from '@lucide/svelte/icons/refresh-cw';
+  import ExternalLink from '@lucide/svelte/icons/external-link';
+  import Sun from '@lucide/svelte/icons/sun';
+  import Moon from '@lucide/svelte/icons/moon';
+  import Monitor from '@lucide/svelte/icons/monitor';
+  import Gauge from '@lucide/svelte/icons/gauge';
+  import { app, notifyLevel } from '../lib/state.svelte.js';
+  import { api, apiBase } from '../lib/api.js';
+  import { clearThumbnailCache, ensureNotificationPermission, isDesktop, openClassic, openUrl, setThumbnailCacheLimit, thumbnailCacheInfo } from '../lib/platform.js';
+  import { bytes, count } from '../lib/format.js';
+
+  const LIMITS = [[0, 'No limit'], [5, '5 Mbit/s'], [20, '20 Mbit/s'], [50, '50 Mbit/s'], [100, '100 Mbit/s']];
+  let custom = $state('');
+
+  async function setLimit(value) {
+    try {
+      const saved = await app.saveTransfer({ max_mbps: Math.max(0, Number(value) || 0) });
+      custom = '';
+      const running = saved.applied_to_running ? ` (also applied to ${saved.applied_to_running} running ${saved.applied_to_running === 1 ? 'upload' : 'uploads'})` : '';
+      app.toast(saved.max_mbps ? `Speed limit set to ${saved.max_mbps} Mbit/s${running}` : `Speed limit removed${running}`, 'success', { timeout: 3000 });
+    } catch (err) {
+      app.toast(`Couldn't save the speed limit: ${err.message}`, 'error');
+    }
+  }
+
+  async function setParallel(n) {
+    try {
+      await app.saveTransfer({ parallel_jobs: n });
+      app.toast(n === 1 ? 'Uploads run one at a time' : `Up to ${n} uploads run at once`, 'success', { timeout: 3000 });
+    } catch (err) {
+      app.toast(`Couldn't save: ${err.message}`, 'error');
+    }
+  }
+
+  let thumbCache = $state(null);
+  let thumbCacheMb = $derived(Number(app.prefs.thumb_cache_mb) || 250);
+  let thumbMaxMib = $derived(Number(app.prefs.thumb_max_mib) || 20);
+  $effect(() => {
+    if (isDesktop) thumbnailCacheInfo().then((info) => (thumbCache = info)).catch(() => {});
+  });
+  async function clearThumbs() {
+    thumbCache = await clearThumbnailCache().catch(() => thumbCache);
+    app.toast('Thumbnail cache cleared', 'success', { timeout: 3000 });
+  }
+  async function setThumbLimit(mb) {
+    app.savePrefs({ thumb_cache_mb: mb });
+    thumbCache = await setThumbnailCacheLimit(mb).catch(() => thumbCache);
+  }
+
+  async function setParts(on) {
+    try {
+      await app.saveTransfer({ parallel_parts: on });
+      app.toast(on ? 'Large files upload in parallel parts' : 'Large files upload as one stream each (keeps MD5 checksums)', 'success', { timeout: 3500 });
+    } catch (err) {
+      app.toast(`Couldn't save: ${err.message}`, 'error');
+    }
+  }
+
+  let checking = $state(false);
+  let signingIn = $state(false);
+  let auth = $derived(app.auth);
+
+  async function refresh() {
+    checking = true;
+    try {
+      await app.refreshAuth(true);
+    } finally {
+      checking = false;
+    }
+  }
+
+  async function signIn() {
+    signingIn = true;
+    try {
+      await api.signIn();
+      app.toast('Finish signing in in your browser, then come back here.', 'info', { timeout: 8000 });
+      // Re-check until the sign-in window is done (up to ~5 minutes).
+      for (let i = 0; i < 60; i++) {
+        await new Promise((r) => setTimeout(r, 5000));
+        await app.refreshAuth(true);
+        if (!app.auth?.login_in_progress) break;
+      }
+    } catch (err) {
+      app.toast(err.message, 'error', { timeout: 10000 });
+    } finally {
+      signingIn = false;
+    }
+  }
+
+  let updateChecking = $state(false);
+  let updateChecked = $state('');
+  async function checkNow() {
+    updateChecking = true;
+    try {
+      const found = await app.checkForUpdates();
+      updateChecked = found ? '' : `You have the latest version (${app.desktop?.version}), or the check couldn't reach GitHub.`;
+    } finally {
+      updateChecking = false;
+    }
+  }
+  function setUpdateCheck(on) {
+    app.savePrefs({ update_check: on });
+    app.scheduleUpdateChecks();
+  }
+
+  function setNotifyLevel(level) {
+    app.savePrefs({ notify_level: level, notifications: level !== 'off' });
+    if (level !== 'off') ensureNotificationPermission();
+  }
+  function setQuiet(changes) {
+    app.savePrefs({ quiet_hours: { on: false, from: '22:00', to: '07:00', ...app.prefs.quiet_hours, ...changes } });
+  }
+</script>
+
+<section class="view">
+  <header class="view-head">
+    <h1>Settings</h1>
+  </header>
+
+  <div class="stack">
+    <div class="card panel">
+      <div class="panel-head">
+        <div>
+          <h2>Google Cloud account</h2>
+          <p class="sub">JetStream uses your own Google sign-in. No shared keys are stored.</p>
+        </div>
+        <button class="btn ghost sm" disabled={checking} onclick={refresh}><RefreshCw size={14} class={checking ? 'spin' : ''} /> Check again</button>
+      </div>
+      {#if !auth}
+        <p class="muted">Checking…</p>
+      {:else if !auth.gcloud_installed && !auth.adc_available}
+        <div class="callout warning">
+          The Google Cloud SDK isn't installed. It's needed to sign in and for gcloud uploads.
+          <button class="btn sm" onclick={() => openUrl('https://cloud.google.com/sdk/docs/install')}><ExternalLink size={14} /> Install it</button>
+        </div>
+      {:else}
+        <div class="account-grid">
+          <div>
+            <div class="label">Signed in as</div>
+            <div class="value">{auth.gcloud_account || auth.service_account || '—'}</div>
+          </div>
+          <div>
+            <div class="label">Uploads (gcloud)</div>
+            <div class="value">{#if auth.gcloud_account}<span class="pill success">Ready</span>{:else}<span class="pill warning">Not signed in</span>{/if}</div>
+          </div>
+          <div>
+            <div class="label">Bucket browsing &amp; engine</div>
+            <div class="value">{#if auth.adc_available}<span class="pill success">Ready</span>{:else}<span class="pill warning">Not signed in</span>{/if}</div>
+          </div>
+        </div>
+        {#if !auth.gcloud_account || !auth.adc_available || auth.login_in_progress}
+          <button class="btn primary" disabled={signingIn || auth.login_in_progress} onclick={signIn}>
+            <LogIn size={16} /> {auth.login_in_progress ? 'Waiting for browser sign-in…' : 'Sign in with Google'}
+          </button>
+        {/if}
+      {/if}
+    </div>
+
+    <div class="card panel">
+      <h2>Uploads</h2>
+      <p class="sub">The tool new folders use. Each folder can override this when you edit it.</p>
+      <div class="choices">
+        {#each app.tools as tool (tool.id)}
+          <label class="choice" class:selected={app.prefs.default_upload_tool === tool.id} class:disabled={!tool.available}>
+            <input
+              type="radio"
+              name="tool"
+              value={tool.id}
+              disabled={!tool.available}
+              checked={app.prefs.default_upload_tool === tool.id}
+              onchange={() => app.savePrefs({ default_upload_tool: tool.id })}
+            />
+            <span>
+              <strong>{tool.label}</strong>
+              <small>{tool.available ? tool.description : tool.detail}</small>
+            </span>
+          </label>
+        {/each}
+      </div>
+
+      <div class="limit">
+        <span class="label">Uploads at once</span>
+        <p class="sub">
+          How many jobs run at the same time, for example the subfolders of a folder uploaded "each subfolder as its own job". One at a time
+          is usually fastest with the JetStream engine, which already sends many files in parallel.
+        </p>
+        <div class="chips" role="radiogroup" aria-label="Uploads at once">
+          {#each [1, 2, 3, 4] as n (n)}
+            <button class="chip" role="radio" aria-checked={app.transfer.parallel_jobs === n} class:on={app.transfer.parallel_jobs === n} onclick={() => setParallel(n)}>{n === 1 ? 'One at a time' : n}</button>
+          {/each}
+        </div>
+      </div>
+
+      <div class="limit">
+        <span class="label">Large files</span>
+        <label class="toggle">
+          <input type="checkbox" checked={app.transfer.parallel_parts !== false} onchange={(e) => setParts(e.currentTarget.checked)} />
+          <span>
+            <strong>Upload large files in parallel parts</strong>
+            <small>
+              With the JetStream engine, files over 256 MB go up as up to 32 parts at once and are joined in the bucket, often several times faster on long-distance
+              connections. The joined file is checked against the original by CRC32C; it has no MD5 checksum, so turn this off if your data needs MD5. Skipped
+              automatically for buckets with a retention policy or a Nearline/Coldline/Archive storage class.
+            </small>
+          </span>
+        </label>
+      </div>
+
+      {#if isDesktop}
+        <div class="limit">
+          <span class="label">Speed check</span>
+          <p class="sub">
+            Uploads slower than expected? This measures what limits them: the network over one connection and over several, and the time each request takes.
+            Use <strong>Speed check…</strong> on a synced folder's card to include reading that folder. Nothing is stored in the bucket.
+          </p>
+          <div><button class="btn" onclick={() => (app.speedCheck = {})}><Gauge size={15} /> Speed check…</button></div>
+        </div>
+      {/if}
+
+      <div class="limit">
+        <span class="label">Upload and download speed limit</span>
+        <p class="sub">
+          Keeps JetStream from using all of a shared or slow connection (e.g. on a ship or at a field station). Applies to the JetStream engine and to
+          downloads and file uploads in the app, including transfers already running; gcloud uploads aren't limited.
+        </p>
+        <div class="chips" role="radiogroup" aria-label="Speed limit">
+          {#each LIMITS as [value, label] (value)}
+            <button class="chip" role="radio" aria-checked={app.transfer.max_mbps === value} class:on={app.transfer.max_mbps === value} onclick={() => setLimit(value)}>{label}</button>
+          {/each}
+          <form class="custom" onsubmit={(e) => { e.preventDefault(); setLimit(Number(custom)); }}>
+            <input class="input" type="number" min="0" step="1" placeholder="Custom" aria-label="Custom limit in megabits per second" bind:value={custom} />
+            <span class="muted">Mbit/s</span>
+            <button class="btn sm" type="submit" disabled={custom === '' || custom === null}>Set</button>
+          </form>
+        </div>
+        <span class="muted">
+          {#if app.transfer.max_mbps}Limited to {app.transfer.max_mbps} Mbit/s (about {(app.transfer.max_mbps / 8).toFixed(1)} MB/s).{:else}No limit.{/if}
+        </span>
+      </div>
+    </div>
+
+    {#if isDesktop}
+      <div class="card panel">
+        <h2>Cloud storage thumbnails</h2>
+        <p class="sub">
+          Turn thumbnails on with the <strong>Thumbnails</strong> button in Cloud storage. Small copies are kept in a cache on this computer
+          {thumbCache?.dir?.includes('JetStreamData') ? '(in the portable JetStreamData folder)' : ''} so folders open quickly the next time.
+        </p>
+        <div class="limit">
+          <span class="label">Cache</span>
+          <p class="sub">
+            {#if thumbCache}{bytes(thumbCache.bytes)} used by {count(thumbCache.files)} {thumbCache.files === 1 ? 'thumbnail' : 'thumbnails'}{:else}…{/if}
+            <button class="btn sm" disabled={!thumbCache?.bytes} onclick={clearThumbs}>Clear</button>
+          </p>
+          <div class="chips" role="radiogroup" aria-label="Cache size limit">
+            {#each [[100, '100 MB'], [250, '250 MB'], [1000, '1 GB']] as [mb, label] (mb)}
+              <button class="chip" role="radio" aria-checked={thumbCacheMb === mb} class:on={thumbCacheMb === mb} onclick={() => setThumbLimit(mb)}>{label}</button>
+            {/each}
+          </div>
+          <small class="muted">The oldest thumbnails are removed when the cache is full.</small>
+        </div>
+        <div class="limit">
+          <span class="label">Largest image to preview</span>
+          <div class="chips" role="radiogroup" aria-label="Largest image to preview">
+            {#each [10, 20, 50] as mib (mib)}
+              <button class="chip" role="radio" aria-checked={thumbMaxMib === mib} class:on={thumbMaxMib === mib} onclick={() => app.savePrefs({ thumb_max_mib: mib })}>{mib} MB</button>
+            {/each}
+          </div>
+          <small class="muted">
+            Bigger images show a "click to preview" button instead of downloading by themselves. Camera JPEGs usually need only their first 128 KB,
+            whatever their size. Nearline, Coldline and Archive images always wait for a click, because retrieving them is charged.
+          </small>
+        </div>
+      </div>
+    {/if}
+
+    <div class="card panel">
+      <h2>Appearance &amp; notifications</h2>
+      <div class="row">
+        <span class="label">Theme</span>
+        <div class="segmented">
+          {#each [['system', 'System', Monitor], ['light', 'Light', Sun], ['dark', 'Dark', Moon]] as [id, label, Icon] (id)}
+            <button class:active={app.prefs.theme === id} onclick={() => app.savePrefs({ theme: id })}><Icon size={14} /> {label}</button>
+          {/each}
+        </div>
+      </div>
+      <div class="row stack">
+        <span>
+          <span class="label">Desktop notifications</span>
+          <small class="muted">{notifyLevel(app.prefs) === 'problems' ? "Only when something needs you: a failed sync or files that couldn't be verified." : notifyLevel(app.prefs) === 'all' ? 'When an upload or preview finishes or fails, and when files couldn’t be verified.' : 'None. Messages still show inside JetStream.'}</small>
+        </span>
+        <div class="segmented">
+          {#each [['all', 'All'], ['problems', 'Only problems'], ['off', 'Off']] as [id, label] (id)}
+            <button class:active={notifyLevel(app.prefs) === id} onclick={() => setNotifyLevel(id)}>{label}</button>
+          {/each}
+        </div>
+      </div>
+      {#if notifyLevel(app.prefs) !== 'off'}
+        <div class="row">
+          <label class="toggle quiet">
+            <input type="checkbox" checked={!!app.prefs.quiet_hours?.on} onchange={(e) => setQuiet({ on: e.currentTarget.checked })} />
+            <span>
+              <span class="label">Quiet hours</span>
+              <small class="muted">No notifications in this window (uploads carry on).</small>
+            </span>
+          </label>
+          <span class="times">
+            <input class="input" type="time" aria-label="Quiet from" value={app.prefs.quiet_hours?.from || '22:00'} disabled={!app.prefs.quiet_hours?.on} onchange={(e) => setQuiet({ from: e.currentTarget.value })} />
+            <span class="muted">to</span>
+            <input class="input" type="time" aria-label="Quiet until" value={app.prefs.quiet_hours?.to || '07:00'} disabled={!app.prefs.quiet_hours?.on} onchange={(e) => setQuiet({ to: e.currentTarget.value })} />
+          </span>
+        </div>
+      {/if}
+    </div>
+
+    <div class="card panel">
+      <h2>About</h2>
+      <dl class="about">
+        {#if app.desktop}
+          <dt>JetStream Desktop</dt>
+          <dd>{app.desktop.version}{app.desktop.build ? ` · build ${app.desktop.build}` : ' · local build'}{app.desktop.commit ? ` · ${app.desktop.commit}` : ''}{app.desktop.portable ? ' · portable' : ''}</dd>
+          <dt>Upload engine</dt>
+          <dd>{app.desktop.engine}</dd>
+        {/if}
+        <dt>JetStream server</dt>
+        <dd>{app.version || '…'} <span class="muted">(the Python package, versioned separately)</span></dd>
+      </dl>
+      {#if app.desktop}
+        <button class="link-btn" onclick={() => (app.whatsNew = app.desktop.version)}>What's new in {app.desktop.version}</button>
+      {/if}
+      {#if isDesktop}
+        <div class="updates">
+          {#if app.update}
+            <p class="update-line">
+              <strong>JetStream {app.update.latest} is available.</strong>
+              {app.desktop?.portable ? 'Unzip the new portable version, then move the JetStreamData folder from this copy into it to keep your job history.' : 'Download and run the new installer.'}
+            </p>
+            <div class="btn-row">
+              <button class="btn primary" onclick={() => openUrl(app.update.url)}><ExternalLink size={15} /> Release page</button>
+              {#if app.update.download}
+                <button class="btn" onclick={() => openUrl(app.update.download)}>Download portable zip</button>
+              {/if}
+            </div>
+          {:else if updateChecked}
+            <p class="muted update-line">{updateChecked}</p>
+          {/if}
+          <div class="btn-row">
+            <button class="btn" disabled={updateChecking} onclick={checkNow}><RefreshCw size={15} /> {updateChecking ? 'Checking…' : 'Check for updates'}</button>
+          </div>
+          <label class="row toggle">
+            <span>
+              <span class="label">Check for new versions</span>
+              <small class="muted">Once a day, asks GitHub for the latest JetStream Desktop release. Nothing is downloaded or installed on its own.</small>
+            </span>
+            <input type="checkbox" checked={app.prefs.update_check} onchange={(e) => setUpdateCheck(e.currentTarget.checked)} />
+          </label>
+        </div>
+      {/if}
+    </div>
+
+    <div class="card panel">
+      <h2>More settings</h2>
+      <p class="sub">Filters, Drive and other options are still on the classic settings page.</p>
+      <button class="btn" onclick={() => openClassic('static/settings.html', apiBase())}><ExternalLink size={15} /> Open classic settings</button>
+    </div>
+  </div>
+</section>
+
+<style>
+  .row.stack {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .row.stack > span {
+    display: flex;
+    flex-direction: column;
+  }
+  .segmented button {
+    white-space: nowrap;
+  }
+  .link-btn {
+    display: block;
+    text-align: left;
+    border: none;
+    background: none;
+    padding: 0;
+    margin-top: 10px;
+    color: var(--accent);
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .times {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .times .input {
+    width: 120px;
+  }
+  .quiet {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+  }
+  .quiet > span {
+    display: flex;
+    flex-direction: column;
+  }
+  .updates {
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid var(--border);
+    display: grid;
+    gap: 10px;
+  }
+  .update-line {
+    margin: 0;
+    font-size: 13.5px;
+  }
+  .btn-row {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .about {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 6px 16px;
+    margin: 0;
+    font-size: 13.5px;
+  }
+  .about dt {
+    color: var(--muted);
+  }
+  .about dd {
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 12.5px;
+  }
+  .view {
+    padding: 28px 32px 40px;
+    max-width: 860px;
+  }
+  .view-head {
+    margin-bottom: 20px;
+  }
+  h1 {
+    font-size: 24px;
+  }
+  h2 {
+    font-size: 16px;
+  }
+  .stack {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .panel {
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .panel-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .sub,
+  .muted {
+    color: var(--muted);
+    margin: 3px 0 0;
+  }
+  .label {
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--text-2);
+  }
+  .value {
+    margin-top: 4px;
+    word-break: break-all;
+  }
+  .panel > .btn {
+    align-self: flex-start;
+  }
+  .account-grid {
+    display: grid;
+    grid-template-columns: 1.4fr 1fr 1fr;
+    gap: 16px;
+  }
+  .callout {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 14px;
+    border-radius: var(--radius-sm);
+  }
+  .callout.warning {
+    background: var(--warning-soft);
+    color: var(--warning);
+  }
+  .choices {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .choice {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+    padding: 12px 14px;
+    border: 1.5px solid var(--border);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+  }
+  .choice.selected {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+  }
+  .choice.disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+  .choice input {
+    margin-top: 3px;
+    accent-color: var(--accent);
+  }
+  .choice span {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .choice small {
+    color: var(--muted);
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+  }
+  .toggle {
+    cursor: pointer;
+  }
+  .toggle > span {
+    display: flex;
+    flex-direction: column;
+  }
+  .toggle input {
+    width: 18px;
+    height: 18px;
+    accent-color: var(--accent);
+  }
+  .segmented {
+    display: inline-flex;
+    padding: 3px;
+    border-radius: 9px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+  }
+  .segmented button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 28px;
+    padding: 0 12px;
+    border: none;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--text-2);
+    font-weight: 550;
+    cursor: pointer;
+  }
+  .segmented button.active {
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: var(--shadow);
+  }
+  .limit {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 18px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border);
+  }
+  .limit .sub {
+    margin: 0;
+  }
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+  }
+  .chip {
+    height: 30px;
+    padding: 0 12px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text-2);
+    cursor: pointer;
+    font: inherit;
+    font-size: 13px;
+  }
+  .chip.on {
+    background: var(--accent-soft);
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .custom {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: 6px;
+  }
+  .custom .input {
+    width: 90px;
+    height: 30px;
+  }
+  .limit .muted {
+    color: var(--muted);
+    font-size: 13px;
+  }
+</style>

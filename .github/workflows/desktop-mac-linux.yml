@@ -1,0 +1,78 @@
+name: Build desktop app (macOS)
+
+# The macOS (.dmg) build of JetStream Desktop. Parked for now: Windows and Linux build on every
+# push (desktop.yml). Run this by hand from the Actions tab ("Run workflow") when a macOS build
+# is wanted; to build it automatically, add macos-latest to desktop.yml's matrix instead.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: desktop-mac-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+    runs-on: ${{ matrix.platform }}
+    permissions:
+      contents: write
+    env:
+      JETSTREAM_BUILD: ${{ github.run_number }}
+      JETSTREAM_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            desktop/src-tauri -> target
+            desktop/transfer -> target
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      - name: Build bundled JetStream server
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+          python desktop/scripts/build_sidecar.py
+
+      - name: Build JetStream upload engine
+        run: python desktop/scripts/build_engine.py
+
+      - name: Install Tauri CLI
+        working-directory: desktop
+        run: npm ci || npm install
+
+      - name: Build installers
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: desktop
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Package portable build and collect installers
+        # macOS: the .dmg (the .app inside is already portable).
+        run: python desktop/scripts/build_desktop.py --package-only
+
+      - name: Upload build
+        uses: actions/upload-artifact@v5
+        with:
+          name: jetstream-desktop-${{ matrix.platform }}
+          path: desktop/release/*
+          if-no-files-found: error

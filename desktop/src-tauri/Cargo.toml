@@ -1,0 +1,30 @@
+[package]
+name = "jetstream-desktop"
+version = "0.2.0"
+description = "NOAA JetStream desktop app"
+edition = "2021"
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+crc32c = "0.6"
+base64 = "0.22"
+tokio = { version = "1", features = ["sync"] }
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+tauri = { version = "2.12", features = ["tray-icon"] }
+tauri-plugin-dialog = "2.8"
+tauri-plugin-notification = "2.7"
+tauri-plugin-shell = "2.5"
+tauri-plugin-single-instance = "2.5"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+jetstream-transfer = { path = "../transfer" }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

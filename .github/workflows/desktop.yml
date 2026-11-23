@@ -1,0 +1,146 @@
+name: Build desktop app (Windows and Linux)
+
+# Builds JetStream Desktop for Windows (the portable .zip, the main download, plus the .msi and
+# setup .exe installers) and Linux (a portable .zip plus .AppImage and .deb), each uploaded as a
+# workflow artifact. It runs on pushes
+# that change the app (any branch), by hand from the Actions tab, and on tags like
+# desktop-v0.2.0, which also create a draft release with everything attached.
+#
+# Versions: the desktop app has its own version (desktop/src-tauri/tauri.conf.json; change it
+# with desktop/scripts/set_version.py), separate from the Python package. Every build also
+# carries its build number and commit (JETSTREAM_BUILD / JETSTREAM_COMMIT below), shown in the
+# app and in the portable zip's name: JetStream-0.2.0-build18-windows-x64-portable.zip.
+#
+# Linux builds on ubuntu-22.04 so the AppImage also runs on older distributions.
+# The macOS build is in desktop-mac-linux.yml (run by hand for now).
+# To build locally instead: desktop/scripts/build_windows.ps1 or desktop/scripts/build_desktop.py.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "desktop-v*"
+    # Path filters apply to branch pushes only; tag pushes always build.
+    paths:
+      - "desktop/**"
+      - "jetstream/**"
+      - "requirements.txt"
+      - ".github/workflows/desktop.yml"
+      - "desktop/scripts/**"
+      # Documentation-only changes don't rebuild (and don't cancel a build in progress).
+      - "!**/*.md"
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+          - platform: ubuntu-22.04
+    runs-on: ${{ matrix.platform }}
+    permissions:
+      contents: write
+    env:
+      JETSTREAM_BUILD: ${{ github.run_number }}
+      JETSTREAM_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev patchelf
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Check the desktop version
+        # The version files must agree; a release tag must match them.
+        run: python desktop/scripts/set_version.py --check ${{ startsWith(github.ref, 'refs/tags/desktop-v') && format('--tag {0}', github.ref_name) || '' }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            desktop/src-tauri -> target
+            desktop/transfer -> target
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      - name: Build bundled JetStream server
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+          python desktop/scripts/build_sidecar.py --portable
+
+      - name: Build JetStream upload engine
+        run: python desktop/scripts/build_engine.py
+
+      - name: Install Tauri CLI
+        working-directory: desktop
+        run: npm ci || npm install
+
+      - name: Test UI helpers
+        working-directory: desktop
+        run: npm run test:ui
+
+      - name: Release notes
+        # A release tag needs a section for its version in desktop/CHANGELOG.md; that section
+        # becomes the release's description.
+        id: notes
+        if: startsWith(github.ref, 'refs/tags/desktop-v')
+        shell: bash
+        run: |
+          python desktop/scripts/release_notes.py "${{ github.ref_name }}" -o release-notes.md
+          {
+            echo "body<<JETSTREAM_NOTES_END"
+            cat release-notes.md
+            echo "JETSTREAM_NOTES_END"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build installers
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: desktop
+          tagName: ${{ startsWith(github.ref, 'refs/tags/desktop-v') && github.ref_name || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/desktop-v') && format('JetStream Desktop {0}', github.ref_name) || '' }}
+          releaseBody: ${{ steps.notes.outputs.body }}
+          releaseDraft: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Package portable build and collect installers
+        # JetStream-<version>-build<N>-<windows|linux>-x64-portable.zip (unzip and run, no
+        # install; the server is a folder inside it) plus the installers: .msi and setup .exe on
+        # Windows, .AppImage and .deb on Linux.
+        run: python desktop/scripts/build_desktop.py --package-only
+
+      - name: Upload build
+        uses: actions/upload-artifact@v5
+        with:
+          name: jetstream-desktop-${{ matrix.platform }}
+          path: desktop/release/*
+          if-no-files-found: error
+
+      - name: Attach portable build to the draft release
+        if: startsWith(github.ref, 'refs/tags/desktop-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          draft: true
+          files: desktop/release/*-portable.zip

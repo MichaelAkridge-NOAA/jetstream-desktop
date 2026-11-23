@@ -1,0 +1,658 @@
+<script>
+  import Folder from '@lucide/svelte/icons/folder';
+  import Cloud from '@lucide/svelte/icons/cloud';
+  import Play from '@lucide/svelte/icons/play';
+  import Eye from '@lucide/svelte/icons/eye';
+  import Ellipsis from '@lucide/svelte/icons/ellipsis';
+  import Square from '@lucide/svelte/icons/square';
+  import CloudUpload from '@lucide/svelte/icons/cloud-upload';
+  import Clock from '@lucide/svelte/icons/clock';
+  import Pause from '@lucide/svelte/icons/pause';
+  import GitCompare from '@lucide/svelte/icons/git-compare-arrows';
+  import ShieldCheck from '@lucide/svelte/icons/shield-check';
+  import ShieldAlert from '@lucide/svelte/icons/shield-alert';
+  import CircleCheck from '@lucide/svelte/icons/circle-check';
+  import ArrowUpCircle from '@lucide/svelte/icons/circle-arrow-up';
+  import RefreshCw from '@lucide/svelte/icons/refresh-cw';
+  import StatusIcon from './StatusIcon.svelte';
+  import { folderStatus } from '../lib/status.svelte.js';
+  import ProgressBar from './ProgressBar.svelte';
+  import { app, ACTIVE, TERMINAL, collapseRuns, notVerified, finishedText } from '../lib/state.svelte.js';
+  import { isHidden, tagsOf, updateOptions } from '../lib/folders.svelte.js';
+  import EyeOff from '@lucide/svelte/icons/eye-off';
+  import PartyPopper from '@lucide/svelte/icons/circle-check-big';
+  import { api, pollActivity } from '../lib/api.js';
+  import { bytes, count, duration, relativeTime, normalizeDestination, scheduleText, upcoming } from '../lib/format.js';
+  import { isDesktop, revealPath } from '../lib/platform.js';
+
+  let { preset, selecting = false, selected = false, focused = false, onselect = () => {} } = $props();
+
+  // A split upload (one job per subfolder) counts as one run.
+  let jobs = $derived(collapseRuns(app.jobsForPreset(preset)));
+  let current = $derived(jobs.find((j) => ACTIVE.has(j.status)));
+  let group = $derived(current?.group || null);
+  /** The job actually running (for a split upload, the current subfolder's). */
+  let runningJob = $derived(group ? (group.current?.status === 'running' ? group.current : null) : current?.status === 'running' ? current : null);
+  let lastFinished = $derived(jobs.find((j) => TERMINAL.has(j.status)));
+  let lastReal = $derived(jobs.find((j) => TERMINAL.has(j.status) && !j.dry_run));
+  let previewReady = $derived(
+    lastFinished && lastFinished.dry_run && lastFinished.status === 'completed' && (!lastReal || lastReal.created_at < lastFinished.created_at),
+  );
+  let tool = $derived(preset.options?.upload_tool === 'jetstream' && app.toolAvailable('jetstream') ? 'JetStream engine' : 'gcloud');
+  let speed = $derived(runningJob ? app.speedOf(runningJob.job_id) : 0);
+  let remaining = $derived(
+    current && speed > 0 ? Math.max(0, (current.total_size_bytes - current.bytes_uploaded) / speed) : null,
+  );
+
+  let nowFile = $state('');
+  let paused = $state(false);
+  let activity = $state(null);
+  let runningId = $derived(runningJob?.job_id || null);
+  $effect(() => {
+    const id = runningId;
+    nowFile = '';
+    paused = false;
+    activity = null;
+    if (!id) return;
+    return pollActivity(id, (a) => {
+      activity = a;
+      const stuck = a.in_flight.find((f) => f.retry);
+      const first = a.in_flight[0];
+      nowFile = stuck
+        ? `${stuck.path} — retrying (${stuck.retry.attempt}/${stuck.retry.max_attempts})`
+        : first ? `${first.path}${first.parts ? ` · in ${first.parts} parallel parts` : ''}` : a.recent[0]?.path || '';
+      paused = !!a.paused;
+    }, 2500);
+  });
+  /** What the engine is doing right now, in words. */
+  let phaseText = $derived.by(() => {
+    if (paused) return 'Paused at';
+    if (activity?.offline) return 'Waiting for the internet connection ·';
+    const phase = activity?.phase;
+    if (phase === 'counting') return 'Counting files…';
+    if (phase === 'scanning') return 'Looking through the folder…';
+    if (phase === 'listing') return `Checking what's in the cloud${activity.checking?.listed_objects ? ` (${count(activity.checking.listed_objects)} listed)` : ''}…`;
+    return current?.dry_run ? 'Previewing…' : 'Syncing…';
+  });
+  let checkingText = $derived.by(() => {
+    const c = activity?.checking;
+    if (!c || activity?.phase !== 'uploading' || !c.files_total || c.hashed_files >= c.files_total) return '';
+    return `Reading files to check: ${count(c.hashed_files)} of ${count(c.files_total)}`;
+  });
+  let partName = (job) => (job.filters?.group_part ? `${job.filters.group_part}/` : 'files in the main folder');
+  // Latest verification receipt, and a verification running now.
+  let receipt = $derived(app.receipts[preset.preset_id]);
+  let verifying = $derived(app.verifying[preset.preset_id]);
+  let unverified = $derived(receipt ? notVerified(receipt.totals) : 0);
+  $effect(() => {
+    void preset.preset_id;
+    if (isDesktop) app.loadReceipts(preset);
+  });
+  let tags = $derived(tagsOf(preset));
+  let hidden = $derived(isHidden(preset));
+  let done = $derived(app.justFinished[preset.preset_id]);
+
+  async function setHidden(on) {
+    menuOpen = false;
+    try {
+      await updateOptions(preset, { hidden: on });
+      await app.refreshPresets();
+      app.toast(on ? `${preset.name} is hidden from the list` : `${preset.name} is back in the list`, 'info', {
+        timeout: 5000,
+        action: { label: 'Undo', run: async () => { await updateOptions({ ...preset, options: { ...preset.options, hidden: on } }, { hidden: !on }); await app.refreshPresets(); } },
+      });
+    } catch (err) {
+      app.toast(`Couldn't save: ${err.message}`, 'error');
+    }
+  }
+  let schedule = $derived(preset.options?.schedule);
+  let scheduled = $derived(schedule && schedule.mode && schedule.mode !== 'off');
+
+  let menuOpen = $state(false);
+  // Asked to start and not yet showing as a job (also when started from the folder dialog).
+  let starting = $derived(app.starting[preset.preset_id]);
+  let uploadAfter = $derived(!!app.uploadAfterPreview[preset.preset_id]);
+  // What's new since the last sync, from the background check (no file reads).
+  let status = $derived(folderStatus.of(preset));
+  // Right after an upload, the last check is from before it: don't show its counts.
+  let staleAfterDone = $derived(!!(done && status && status.checked_at < done.at));
+  let checking = $derived(!!folderStatus.checking[preset.preset_id]);
+  let autoAt = $derived(folderStatus.autoAt[preset.preset_id]);
+  let changes = $derived(status && !status.error && !(done && status.checked_at < done.at) ? status.changes : null);
+  const ago = (ms) => relativeTime(new Date(ms).toISOString());
+  const clock = (ms) => new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  // A failure is old news once a later check finds everything uploaded.
+  let failureCleared = $derived(!!(lastFinished?.status === 'failed' && status && !status.error && status.changes === 0 && status.checked_at > Date.parse(lastFinished.completed_at)));
+  let busy = $derived(!!starting);
+
+  function run(dryRun) {
+    app.runPreset(preset, dryRun);
+  }
+
+  function openCloud() {
+    menuOpen = false;
+    const [bucket, ...rest] = normalizeDestination(preset.destination).split('/');
+    app.cloudLocation = { bucket, prefix: rest.length ? `${rest.join('/')}/` : '' };
+    app.view = 'cloud';
+  }
+
+  async function togglePause() {
+    try {
+      await (paused ? api.resumeJob(runningJob.job_id) : api.pauseJob(runningJob.job_id));
+      paused = !paused;
+    } catch (err) {
+      app.toast(err.message, 'error');
+    }
+  }
+
+  async function cancel() {
+    if (group) return app.cancelGroup(group.id);
+    try {
+      await api.cancelJob(current.job_id);
+    } catch (err) {
+      app.toast(`Couldn't cancel: ${err.message}`, 'error');
+    }
+  }
+
+  async function remove() {
+    menuOpen = false;
+    if (!confirm(`Remove "${preset.name}" from synced folders? Files already uploaded stay in the cloud.`)) return;
+    await app.removePreset(preset);
+  }
+</script>
+
+<svelte:window onclick={() => (menuOpen = false)} />
+
+<article class="card folder" class:running={current} class:picked={selecting && selected} class:focused class:hidden-folder={hidden} data-folder={preset.preset_id}>
+  <header>
+    {#if selecting}
+      <label class="icon pick" title="Select {preset.name}"><input type="checkbox" checked={selected} onchange={onselect} aria-label="Select {preset.name}" /></label>
+    {:else}
+      <div class="icon"><Folder size={20} /></div>
+    {/if}
+    <div class="titles">
+      <h3 class="truncate" title={preset.name}>{preset.name}</h3>
+      <div class="path mono truncate start" title={preset.source_path}><bdi>{preset.source_path}</bdi></div>
+    </div>
+    <div class="menu-wrap">
+      <button class="btn ghost sm icon" aria-label="More actions" onclick={(e) => { e.stopPropagation(); menuOpen = !menuOpen; }}>
+        <Ellipsis size={18} />
+      </button>
+      {#if menuOpen}
+        <div class="menu card" role="menu">
+          <button role="menuitem" onclick={() => app.editFolder(preset)}>Edit…</button>
+          <button role="menuitem" onclick={() => { menuOpen = false; app.tagsSheet = [preset]; }}>Tags…</button>
+          <button role="menuitem" title="Hidden folders keep syncing on their schedule and auto-upload; they're just out of the list" onclick={() => setHidden(!hidden)}>{hidden ? 'Show in the list' : 'Hide from the list'}</button>
+          <button role="menuitem" onclick={() => app.compareFolder(preset)}>Compare with cloud</button>
+          <button role="menuitem" onclick={() => { menuOpen = false; folderStatus.check(preset, { soon: true }); }}>Check for changes now</button>
+          <button role="menuitem" title="Add missing file types and the original files' dates to what's already uploaded (nothing is re-uploaded)" onclick={() => { menuOpen = false; app.fixDetails = { destination: `gs://${normalizeDestination(preset.destination)}/`, preset }; }}>Fix file details in the cloud…</button>
+          <button role="menuitem" disabled={!!verifying} onclick={() => { menuOpen = false; app.createReceipt(preset); }}>Verify now</button>
+          {#if receipt}<button role="menuitem" onclick={() => { menuOpen = false; app.openReceipt(preset); }}>Receipts…</button>{/if}
+          {#if isDesktop}
+            <button role="menuitem" title="Find out what limits uploads from this folder: the disk or share, the network, or per-file overhead" onclick={() => { menuOpen = false; app.speedCheck = { destination: `gs://${normalizeDestination(preset.destination)}/`, localPath: preset.source_path }; }}>Speed check…</button>
+          {/if}
+          <button role="menuitem" onclick={() => openCloud()}>Open in Cloud storage</button>
+          {#if isDesktop}
+            <button role="menuitem" onclick={() => revealPath(preset.source_path)}>Show folder</button>
+          {/if}
+          {#if jobs.length}
+            <button role="menuitem" onclick={() => app.openJob(jobs[0].job_id)}>Latest activity</button>
+          {/if}
+          <button role="menuitem" class="danger" onclick={remove}>Remove…</button>
+        </div>
+      {/if}
+    </div>
+  </header>
+
+  <div class="dest">
+    <Cloud size={15} />
+    <span class="mono truncate start" title={`gs://${normalizeDestination(preset.destination)}/`}><bdi>gs://{normalizeDestination(preset.destination)}/</bdi></span>
+    {#if preset.options?.auto_upload}<span class="pill auto" title="New files are uploaded automatically">Auto-upload</span>{/if}
+    {#if hidden}<span class="pill" title="Hidden from the list (still syncs)"><EyeOff size={11} /> Hidden</span>{/if}
+    <span class="pill">{tool}</span>
+  </div>
+
+  {#if tags.length}
+    <div class="tags">
+      {#each tags as t (t)}<button class="pill tag" title="Show folders tagged {t}" onclick={() => (app.folderQuery = { ...app.folderQuery, tag: t })}>{t}</button>{/each}
+    </div>
+  {/if}
+
+  {#if done && !current}
+    <div class="done" role="status">
+      <span class="pop"><PartyPopper size={18} /></span>
+      <span><strong>Upload complete</strong><span class="muted"> · {finishedText(done)}</span></span>
+    </div>
+  {/if}
+
+  <div class="status">
+    {#if current}
+      {#if current.status === 'running' && activity?.phase === 'counting'}
+        <div class="row">
+          <StatusIcon job={current} size={16} />
+          <strong>Counting files…</strong>
+          <span class="muted">{count(activity.checking?.counted_files || 0)} found so far · {bytes(activity.checking?.counted_bytes || 0)}</span>
+        </div>
+        <ProgressBar indeterminate />
+        {#if group}
+          <div class="now">Folder {group.done + group.failed + group.cancelled + 1} of {group.parts}{#if group.current}: <span class="mono">{partName(group.current)}</span>{/if}</div>
+        {/if}
+      {:else if current.status === 'running'}
+        <div class="row">
+          <StatusIcon job={current} size={16} />
+          <strong>{phaseText} {Math.round(current.progress_percent || 0)}%</strong>
+          <span class="muted">
+            {bytes(current.bytes_uploaded)} of {bytes(current.total_size_bytes)}
+            {#if speed > 0 && !paused && !activity?.offline}· {bytes(speed)}/s{/if}
+            {#if remaining !== null && !paused && !activity?.offline}· {duration(remaining)} left{/if}
+          </span>
+        </div>
+        <ProgressBar value={current.progress_percent || 0} indeterminate={!current.total_size_bytes} />
+        {#if group}
+          <div class="now">
+            Folder {group.done + group.failed + group.cancelled + 1} of {group.parts}{#if group.current}: <span class="mono">{partName(group.current)}</span>{/if}{#if group.failed} · <span class="danger">{group.failed} failed</span>{/if}
+          </div>
+        {/if}
+        {#if current.dry_run && uploadAfter}<div class="now">The upload starts when this preview finishes.</div>{/if}
+        {#if activity?.offline}<div class="now">No connection to Google Cloud for {duration(activity.offline_seconds || 0)}. Uploads continue on their own when it's back.</div>{/if}
+        {#if checkingText}<div class="now">{checkingText}</div>{/if}
+        {#if nowFile}<div class="now mono truncate start" title={nowFile}><bdi>{nowFile}</bdi></div>{/if}
+      {:else}
+        <div class="row">
+          <StatusIcon job={current} size={16} />
+          <strong>{current.status === 'scheduled' ? 'Scheduled' : group ? `Waiting to start · ${group.parts} folders` : 'Waiting to start…'}</strong>
+        </div>
+        <ProgressBar indeterminate />
+      {/if}
+    {:else if starting}
+      <div class="row">
+        <strong>{starting === 'preview' ? 'Starting preview…' : 'Starting sync…'}</strong>
+      </div>
+      <ProgressBar indeterminate />
+    {:else if previewReady}
+      <div class="row">
+        <StatusIcon job={lastFinished} size={16} />
+        <strong>Preview ready</strong>
+        <span class="muted">{relativeTime(lastFinished.completed_at)} · check what will upload, then upload</span>
+      </div>
+    {:else if lastFinished?.status === 'failed' && !failureCleared}
+      <div class="row">
+        <StatusIcon job={lastFinished} size={16} />
+        <strong class="danger">Last sync failed</strong>
+        <span class="muted">{relativeTime(lastFinished.completed_at)}</span>
+      </div>
+      <div class="error truncate" title={lastFinished.error_message}>{lastFinished.error_message || 'See activity for details'}</div>
+    {:else if staleAfterDone}
+      <div class="row muted"><RefreshCw size={14} class="spin" /> Checking what's left…</div>
+    {:else if changes}
+      <div class="row">
+        <span class="state-icon pending"><ArrowUpCircle size={16} /></span>
+        <strong>{count(changes)} new or changed {changes === 1 ? 'file' : 'files'}</strong>
+        <span class="muted">{bytes(status.bytes)} to upload</span>
+      </div>
+      {#if autoAt}<div class="checked auto-note">Uploading automatically at {clock(autoAt)} if nothing else changes</div>{/if}
+      <div class="checked">
+        {#if checking}<RefreshCw size={12} class="spin" /> Checking…{:else}Checked {ago(status.checked_at)}{/if}{lastReal ? ` · last synced ${relativeTime(lastReal.completed_at)}` : ''}
+      </div>
+    {:else if status && !status.error}
+      <div class="row">
+        <span class="state-icon ok"><CircleCheck size={16} /></span>
+        <strong>Up to date</strong>
+        <span class="muted">{count(status.same)} files · {bytes(status.same_bytes)}{status.cloud_only ? ` · ${count(status.cloud_only)} more in the cloud` : ''}</span>
+      </div>
+      <div class="checked">
+        {#if checking}<RefreshCw size={12} class="spin" /> Checking…{:else}Checked {ago(status.checked_at)}{/if}{lastReal ? ` · synced ${relativeTime(lastReal.completed_at)}` : ''}{folderStatus.watched[preset.preset_id] ? ' · watching for new files' : ''}{status.online_only ? ` · ${count(status.online_only)} online-only (OneDrive) skipped` : ''}
+      </div>
+    {:else if !status && checking && !lastFinished}
+      <div class="row muted"><RefreshCw size={14} class="spin" /> Checking what's new…</div>
+    {:else if lastReal?.status === 'completed'}
+      <div class="row">
+        <StatusIcon job={lastReal} size={16} />
+        <strong>Synced {relativeTime(lastReal.completed_at)}</strong>
+        <span class="muted">{count(lastReal.total_files)} files · {bytes(lastReal.total_size_bytes)}{lastReal.duration_seconds ? ` · took ${duration(lastReal.duration_seconds)}` : ''}</span>
+      </div>
+    {:else if lastFinished}
+      <div class="row">
+        <StatusIcon job={lastFinished} size={16} />
+        <strong>{lastFinished.status === 'cancelled' ? 'Last sync cancelled' : 'Preview finished'}</strong>
+        <span class="muted">{relativeTime(lastFinished.completed_at)}</span>
+      </div>
+    {:else}
+      <div class="row muted">Not synced yet — preview first to see what will upload.</div>
+    {/if}
+    {#if status?.error && !current && !starting}
+      <div class="checked danger truncate" title={status.error}>Couldn't check for changes: {status.error}</div>
+    {/if}
+  </div>
+
+  {#if verifying && !current}
+    <div class="verify running" aria-live="polite">
+      <ShieldCheck size={14} />
+      <span>Verifying… {verifying.total ? `${count(verifying.done)} of ${count(verifying.total)} files` : ''}</span>
+      <div class="vbar"><ProgressBar value={verifying.total ? (100 * verifying.done) / verifying.total : 0} indeterminate={!verifying.total} /></div>
+    </div>
+  {:else if receipt && !current}
+    <button class="verify" class:bad={unverified} onclick={() => app.openReceipt(preset)} title="Open the verification receipt">
+      {#if unverified}<ShieldAlert size={14} />{:else}<ShieldCheck size={14} />{/if}
+      <span>
+        {#if unverified}
+          <strong>{count(unverified)} {unverified === 1 ? 'file' : 'files'} not verified</strong>
+        {:else}
+          Verified · {count(receipt.totals?.verified)} files
+        {/if}
+        <span class="muted">· {relativeTime(receipt.finished_at)}</span>
+      </span>
+      <span class="open">{unverified ? 'Review' : 'Receipt'} ›</span>
+    </button>
+  {/if}
+
+  {#if scheduled}
+    <div class="schedule" title={schedule.preview ? 'Scheduled runs are previews only' : ''}>
+      <Clock size={14} />
+      <span>{scheduleText(schedule)}{schedule.preview ? ' · preview only' : ''}</span>
+      {#if preset.next_run_at}<span class="muted">· next {upcoming(preset.next_run_at)}</span>{/if}
+    </div>
+  {/if}
+
+  <footer>
+    {#if current}
+      {#if runningJob && runningJob.upload_tool === 'jetstream' && !runningJob.dry_run}
+        <button class="btn sm" onclick={togglePause}>{#if paused}<Play size={14} /> Resume{:else}<Pause size={14} /> Pause{/if}</button>
+      {/if}
+      {#if current.dry_run}
+        {#if uploadAfter}
+          <button class="btn sm" title="Don't upload when the preview finishes" onclick={() => app.setUploadAfterPreview(preset, false)}><CloudUpload size={15} /> Uploads when done ✓</button>
+        {:else}
+          <button class="btn primary sm" title="Start the upload as soon as this preview finishes" onclick={() => app.setUploadAfterPreview(preset, true)}><CloudUpload size={15} /> Upload when done</button>
+        {/if}
+      {/if}
+      <button class="btn sm" onclick={cancel}><Square size={14} /> {group ? 'Cancel all' : 'Cancel'}</button>
+      <button class="btn ghost sm" onclick={() => app.openJob(current.job_id)}>Details</button>
+    {:else if previewReady}
+      <button class="btn primary sm" disabled={busy} onclick={() => run(false)}><CloudUpload size={15} /> Upload now</button>
+      <button class="btn ghost sm" onclick={() => app.openJob(lastFinished.job_id)}>Review preview</button>
+    {:else if changes}
+      <button class="btn primary sm" disabled={busy} onclick={() => run(false)}><CloudUpload size={15} /> Upload {count(changes)} {changes === 1 ? 'file' : 'files'}</button>
+      <button class="btn sm" disabled={busy} onclick={() => run(true)}><Eye size={15} /> Preview</button>
+      <button class="btn ghost sm" title="What's on this computer vs in the cloud" onclick={() => app.compareFolder(preset)}><GitCompare size={14} /> Compare</button>
+    {:else}
+      <button class="btn sm" class:primary={!status} disabled={busy} onclick={() => run(false)}><Play size={14} /> Sync now</button>
+      <button class="btn sm" disabled={busy} onclick={() => run(true)}><Eye size={15} /> Preview</button>
+      <button class="btn ghost sm" title="What's on this computer vs in the cloud" onclick={() => app.compareFolder(preset)}><GitCompare size={14} /> Compare</button>
+      {#if lastFinished?.status === 'failed' && lastFinished.group}
+        <button class="btn ghost sm" onclick={() => app.retryFailedInGroup(lastFinished.group.id)}>Retry failed folders</button>
+      {:else if lastFinished?.status === 'failed'}
+        <button class="btn ghost sm" onclick={() => app.openJob(lastFinished.job_id)}>View error</button>
+      {/if}
+    {/if}
+  </footer>
+</article>
+
+<style>
+  .folder {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 16px;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  .folder:hover {
+    border-color: var(--border-strong);
+  }
+  .folder.running {
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  }
+  header {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+  }
+  .icon {
+    width: 38px;
+    height: 38px;
+    border-radius: 9px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    display: grid;
+    place-items: center;
+    flex-shrink: 0;
+  }
+  .titles {
+    flex: 1;
+    min-width: 0;
+  }
+  h3 {
+    font-size: 15px;
+  }
+  .path {
+    color: var(--muted);
+    margin-top: 2px;
+  }
+  .menu-wrap {
+    position: relative;
+  }
+  .menu {
+    position: absolute;
+    right: 0;
+    top: 32px;
+    z-index: 20;
+    min-width: 170px;
+    padding: 5px;
+    display: flex;
+    flex-direction: column;
+    box-shadow: var(--shadow-lg);
+  }
+  .menu button {
+    border: none;
+    background: none;
+    text-align: left;
+    padding: 7px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .menu button:hover {
+    background: var(--surface-2);
+  }
+  .menu .danger {
+    color: var(--danger);
+  }
+  .dest {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    color: var(--text-2);
+    min-width: 0;
+  }
+  .dest .mono {
+    flex: 1;
+    min-width: 0;
+  }
+  .status {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-height: 44px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: var(--surface-2);
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    flex-wrap: wrap;
+  }
+  .muted {
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .danger {
+    color: var(--danger);
+  }
+  .error {
+    color: var(--danger);
+    font-size: 12.5px;
+  }
+  .now {
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .checked {
+    color: var(--muted);
+    font-size: 12px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+  }
+  .auto-note {
+    color: var(--accent);
+  }
+  .checked.danger {
+    color: var(--danger);
+    display: block;
+  }
+  .folder.picked {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent);
+  }
+  .pick {
+    cursor: pointer;
+  }
+  .pick input {
+    width: 18px;
+    height: 18px;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+  .state-icon {
+    display: inline-flex;
+  }
+  .state-icon.ok {
+    color: var(--success);
+  }
+  .state-icon.pending {
+    color: var(--accent);
+  }
+  .pill.auto {
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+  .schedule {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-2);
+    font-size: 13px;
+    margin-top: -4px;
+  }
+  footer {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .verify {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    margin-top: 2px;
+    padding: 7px 10px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: var(--success-soft);
+    color: var(--success);
+    font: inherit;
+    font-size: 12.5px;
+    text-align: left;
+    cursor: pointer;
+  }
+  .verify span {
+    color: var(--text-2);
+  }
+  .verify .open {
+    margin-left: auto;
+    color: var(--success);
+    font-weight: 600;
+  }
+  .verify.bad {
+    background: var(--warning-soft);
+    color: var(--warning);
+  }
+  .verify.bad strong,
+  .verify.bad .open {
+    color: var(--warning);
+  }
+  .verify:hover:not(.running) {
+    filter: brightness(0.97);
+  }
+  .verify.running {
+    background: var(--surface-2);
+    color: var(--accent);
+    cursor: default;
+  }
+  .vbar {
+    flex: 1;
+    min-width: 60px;
+  }
+  .folder.focused {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .folder.hidden-folder {
+    opacity: 0.8;
+  }
+  .tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: -2px;
+  }
+  .pill.tag {
+    border: none;
+    cursor: pointer;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font: inherit;
+    font-size: 11.5px;
+  }
+  .done {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 12px;
+    border-radius: var(--radius-sm);
+    background: var(--success-soft);
+    font-size: 13px;
+    animation: done-in 0.35s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .done strong {
+    color: var(--success);
+  }
+  .done .pop {
+    color: var(--success);
+    display: grid;
+    animation: pop 0.6s cubic-bezier(0.2, 1.6, 0.4, 1);
+  }
+  @keyframes done-in {
+    from {
+      opacity: 0;
+      transform: translateY(-4px);
+    }
+  }
+  @keyframes pop {
+    0% {
+      transform: scale(0.3);
+      opacity: 0;
+    }
+    60% {
+      transform: scale(1.25);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .done,
+    .done .pop {
+      animation: none;
+    }
+  }
+</style>

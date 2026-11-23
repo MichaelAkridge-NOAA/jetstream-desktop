@@ -1,0 +1,1927 @@
+"""Core services for upload management and folder analysis."""
+
+import os
+import re
+import subprocess
+import threading
+import uuid
+import random
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple, Callable
+from datetime import datetime, timezone
+from collections import defaultdict, deque
+import asyncio
+import time
+import logging
+import shutil
+import sys
+
+from .config import settings
+from .database import UploadJob, FolderStats, get_db
+from .events import notify_job
+from .models import JobStatus
+
+logger = logging.getLogger(__name__)
+
+_SENSITIVE_PATTERNS = [
+    re.compile(
+        r"(?i)\b(access[_-]?token|refresh[_-]?token|client[_-]?secret|api[_-]?key|password|secret|authorization)\b\s*[:=]\s*([^\s\"']+|\"[^\"]*\"|'[^']*')"
+    ),
+    re.compile(r"(?i)\bAuthorization:\s*Bearer\s+[^\s]+"),
+    re.compile(r"(?i)\b(GOOGLE_APPLICATION_CREDENTIALS|GDRIVE_CLIENT_SECRET)\s*=\s*([^\s\"']+|\"[^\"]*\"|'[^']*')"),
+    re.compile(r"(?i)([?&](?:X-Goog-Signature|X-Goog-Credential|X-Goog-Security-Token|Signature|AWSAccessKeyId)=)[^&\s]+"),
+]
+
+
+def redact_sensitive_text(value: object) -> str:
+    """Redact common credential material before persistence or display."""
+    text = "" if value is None else str(value)
+    for pattern in _SENSITIVE_PATTERNS:
+        if pattern.pattern.startswith("(?i)\\bAuthorization"):
+            text = pattern.sub("Authorization: Bearer [REDACTED]", text)
+        elif "X-Goog" in pattern.pattern or "AWSAccessKeyId" in pattern.pattern:
+            text = pattern.sub(r"\1[REDACTED]", text)
+        else:
+            text = pattern.sub(r"\1=[REDACTED]", text)
+    return text
+
+
+# Job output kept in the database is capped; the full output lives in the job's log file.
+OUTPUT_TAIL_LINES = 200
+OUTPUT_MAX_CHARS = 64 * 1024
+
+
+def cap_output(text: Optional[str], max_chars: int = OUTPUT_MAX_CHARS) -> Optional[str]:
+    """Keep only the end of a long output string so database rows stay small."""
+    if text is None or len(text) <= max_chars:
+        return text
+    return f"[... earlier output truncated; see the job log file for full output ...]\n{text[-max_chars:]}"
+
+
+class OutputCapture:
+    """Stream subprocess output to an optional log file while keeping a bounded tail in memory.
+
+    gcloud/gsutil rsync print one line per file, so holding the full output in memory
+    (and storing it in SQLite) grows without bound on large jobs.
+    """
+
+    def __init__(self, log_file=None, max_lines: int = OUTPUT_TAIL_LINES):
+        self.log_file = log_file
+        self.stdout = deque(maxlen=max_lines)
+        self.stderr = deque(maxlen=max_lines)
+        self.stdout_total = 0
+        self.stderr_total = 0
+        self._lock = threading.Lock()
+
+    def add(self, line: str, stream: str = "stdout") -> None:
+        with self._lock:
+            if stream == "stderr":
+                self.stderr.append(line)
+                self.stderr_total += 1
+            else:
+                self.stdout.append(line)
+                self.stdout_total += 1
+            if self.log_file is not None:
+                try:
+                    self.log_file.write(redact_sensitive_text(line))
+                except Exception:
+                    self.log_file = None
+
+    @staticmethod
+    def _section(lines: deque, total: int) -> str:
+        if not lines:
+            return ""
+        text = "".join(lines)
+        if total > len(lines):
+            text = f"[... {total - len(lines)} earlier line(s) omitted; see log file ...]\n{text}"
+        return text
+
+    def stdout_text(self) -> str:
+        return self._section(self.stdout, self.stdout_total)
+
+    def stderr_text(self) -> str:
+        return self._section(self.stderr, self.stderr_total)
+
+    def summary(self) -> str:
+        """Redacted, size-capped STDOUT/STDERR summary suitable for the database."""
+        stdout = self.stdout_text()
+        stderr = self.stderr_text()
+        return cap_output(redact_sensitive_text(
+            f"STDOUT:\n{stdout if stdout else 'No output'}\n\nSTDERR:\n{stderr if stderr else 'No errors'}"
+        ))
+
+
+_ERROR_LINE_RE = re.compile(r"(?i)error|exception|denied|failed")
+
+
+class ConsoleEcho:
+    """Rate-limited console echo: error lines always print, other lines at most once per interval."""
+
+    def __init__(self, interval_seconds: float = 1.0):
+        self.interval = interval_seconds
+        self._last = 0.0
+
+    def __call__(self, line: str) -> None:
+        now = time.time()
+        if _ERROR_LINE_RE.search(line) or now - self._last >= self.interval:
+            self._last = now
+            print(redact_sensitive_text(line.rstrip()))
+
+# Random word lists for friendly names
+ADJECTIVES = [
+    'swift', 'brave', 'calm', 'bold', 'keen', 'wise', 'cool', 'fast',
+    'bright', 'clear', 'crisp', 'eager', 'fair', 'fine', 'glad', 'good',
+    'happy', 'jolly', 'kind', 'light', 'merry', 'neat', 'nice', 'quick',
+    'safe', 'true', 'warm', 'wild', 'witty', 'zesty'
+]
+
+NOUNS = [
+    # Big cats
+    'lion', 'tiger', 'leopard', 'jaguar', 'cheetah', 'cougar', 'panther',
+    'lynx', 'bobcat', 'ocelot', 'caracal', 'serval', 'puma', 'margay',
+    # Domestic & exotic breeds
+    'siamese', 'persian', 'bengal', 'sphynx', 'ragdoll', 'abyssinian',
+    'birman', 'burmese', 'manx', 'savannah', 'tonkinese', 'korat',
+    'chartreux', 'peterbald', 'toyger', 'ocicat', 'singapura', 'somali',
+    'balinese', 'himalayan', 'munchkin', 'nebelung', 'pixiebob', 'lykoi',
+    # Wild cats
+    'wildcat', 'sandcat', 'junglecat', 'pallas', 'margay', 'kodkod',
+    'oncilla', 'clouded', 'snowleopard', 'fishingcat', 'rustyspot',
+    # Extinct & mythical cats
+    'sabertooth', 'sphinx', 'carbuncle', 'coeurl', 'thundercat',
+    'potato', 'tacocat'
+]
+
+def generate_friendly_job_name(source_path: str = None) -> str:
+    """Generate a user-friendly job name.
+    
+    Format: upload-YYYY-MM-DD-HHmmss-adjective-noun-xxxx
+    Example: upload-2026-01-26-143052-swift-falcon-a3d9
+    """
+    timestamp = datetime.now().strftime('%Y-%m-%d-%H%M%S')
+    adjective = random.choice(ADJECTIVES)
+    noun = random.choice(NOUNS)
+    short_id = uuid.uuid4().hex[:4]
+    
+    friendly_name = f"upload-{timestamp}-{adjective}-{noun}-{short_id}"
+    
+    return friendly_name
+
+class FileFilter:
+    """Handle file filtering based on patterns."""
+    
+    def __init__(self, include_patterns: List[str] = None, 
+                 exclude_patterns: List[str] = None,
+                 exclude_folders: List[str] = None):
+        self.include_patterns = include_patterns or settings.INCLUDE_PATTERNS
+        self.exclude_patterns = exclude_patterns or settings.EXCLUDE_PATTERNS
+        self.exclude_folders = exclude_folders or settings.EXCLUDE_FOLDERS
+        
+        # Compile regex patterns (convert glob to regex if needed)
+        self.include_regex = [re.compile(self._glob_to_regex(p), re.IGNORECASE) for p in self.include_patterns]
+        self.exclude_regex = [re.compile(self._glob_to_regex(p), re.IGNORECASE) for p in self.exclude_patterns]
+    
+    def _glob_to_regex(self, pattern: str) -> str:
+        """Convert a glob pattern to regex, or return as-is if already regex."""
+        # Detect if pattern is already a regex (has regex-specific syntax)
+        # These chars indicate it's likely already a regex: | ( ) ^ $ \ { } [ ] + ?
+        regex_indicators = ['|', '(', ')', '^', '$', '\\', '{', '}', '[', ']', '+', '(?']
+        is_likely_regex = any(indicator in pattern for indicator in regex_indicators)
+        
+        if is_likely_regex:
+            # Already a regex pattern - pass through unchanged
+            return pattern
+        elif pattern.startswith('*.'):
+            # Simple extension match: *.tmp -> .*\.tmp$
+            ext = pattern[2:]
+            return r'.*\.' + re.escape(ext) + r'$'
+        elif pattern.startswith('*'):
+            # Ends with pattern: *something -> .*something$
+            return r'.*' + re.escape(pattern[1:]) + r'$'
+        elif pattern.endswith('*'):
+            # Starts with pattern: something* -> ^something.*
+            return r'^' + re.escape(pattern[:-1]) + r'.*'
+        elif '*' in pattern:
+            # General glob: convert * to .*
+            result = re.escape(pattern)
+            result = result.replace(r'\*', '.*')
+            return result
+        else:
+            # Exact filename match (e.g., Thumbs.db)
+            return re.escape(pattern)
+    
+    def should_include_file(self, filepath: str) -> bool:
+        """Check if file should be included based on patterns."""
+        filename = os.path.basename(filepath)
+        
+        # Check exclude patterns first
+        for pattern in self.exclude_regex:
+            if pattern.match(filename):
+                return False
+        
+        # Check include patterns
+        if not self.include_regex:
+            return True
+        
+        for pattern in self.include_regex:
+            if pattern.match(filename):
+                return True
+        
+        return False
+    
+    def should_exclude_folder(self, folder_name: str) -> bool:
+        """Check if folder should be excluded."""
+        return folder_name in self.exclude_folders
+
+
+def count_files(path: str, recursive: bool = True, file_filter: Optional[FileFilter] = None,
+                on_progress=None, should_stop=None) -> Tuple[int, int]:
+    """Count the files (and bytes) an upload of `path` would cover, with the folder's filters.
+
+    Blocking; run it in a worker thread. on_progress(files, bytes) is called every few thousand
+    files so the UI can show "Counting files… N found"; should_stop() ends the count early.
+    Unreadable folders are skipped.
+    """
+    file_filter = file_filter or FileFilter()
+    files = size = 0
+    stack = [path]
+    while stack:
+        if should_stop and should_stop():
+            break
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if recursive and not file_filter.should_exclude_folder(entry.name):
+                                stack.append(entry.path)
+                        elif file_filter.should_include_file(entry.path):
+                            files += 1
+                            size += entry.stat(follow_symlinks=False).st_size
+                            if on_progress and files % 2000 == 0:
+                                on_progress(files, size)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    if on_progress:
+        on_progress(files, size)
+    return files, size
+
+
+class FolderAnalyzer:
+    """Analyze folder structure and calculate statistics."""
+    
+    def __init__(self, file_filter: FileFilter = None):
+        self.file_filter = file_filter or FileFilter()
+        self.scan_start_time = None
+        self.file_count = 0
+        self.folder_count = 0
+    
+    def get_tree_size_fast(self, path: str) -> int:
+        """Fast tree size calculation using os.scandir (much faster than os.walk).
+        
+        This method is significantly faster for large directories because:
+        1. os.scandir returns DirEntry objects with cached stat info
+        2. Avoids redundant stat() calls
+        3. More efficient than os.walk for size calculation
+        """
+        total = 0
+        try:
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            # Skip excluded folders
+                            if not self.file_filter.should_exclude_folder(entry.name):
+                                total += self.get_tree_size_fast(entry.path)
+                        else:
+                            # Check if file should be included
+                            if self.file_filter.should_include_file(entry.path):
+                                total += entry.stat(follow_symlinks=False).st_size
+                    except (OSError, PermissionError):
+                        continue
+        except (OSError, PermissionError):
+            pass
+        return total
+    
+    def quick_folder_check(self, path: str) -> Tuple[int, int]:
+        """Quick check to count immediate files and subfolders.
+        Returns (file_count, subfolder_count) for performance decision.
+        """
+        file_count = 0
+        folder_count = 0
+        try:
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if not self.file_filter.should_exclude_folder(entry.name):
+                                folder_count += 1
+                        else:
+                            if self.file_filter.should_include_file(entry.path):
+                                file_count += 1
+                    except (OSError, PermissionError):
+                        continue
+        except (OSError, PermissionError):
+            pass
+        return file_count, folder_count
+    
+    def analyze(self, path: str, recursive: bool = True, folder_only_mode: bool = False) -> Dict:
+        """Analyze folder and return statistics.
+        
+        Args:
+            path: Path to analyze
+            recursive: Whether to recurse into subdirectories
+            folder_only_mode: If True, only analyze folder sizes without detailed file enumeration.
+                             This is much faster for large folders.
+        
+        Returns:
+            Dict with folder statistics
+        """
+        self.scan_start_time = time.time()
+        self.file_count = 0
+        self.folder_count = 0
+        
+        stats = {
+            'path': path,
+            'total_files': 0,
+            'total_size_bytes': 0,
+            'file_types': defaultdict(int),
+            'subfolder_count': 0,
+            'subfolders': [],
+            'preview_files': [],
+            'scan_mode': 'detailed',
+            'scan_duration': 0
+        }
+        
+        if not os.path.exists(path):
+            raise ValueError(f"Path does not exist: {path}")
+        
+        # Quick check to determine if we should use folder-only mode
+        if not folder_only_mode and settings.ENABLE_FAST_SCAN:
+            file_count, folder_count = self.quick_folder_check(path)
+            
+            # Switch to folder-only mode if directory is too large
+            if (folder_count > settings.MAX_SUBFOLDERS_FOR_DETAILED_SCAN or 
+                file_count > settings.MAX_FILES_FOR_DETAILED_SCAN):
+                logger.info(f"Large directory detected ({folder_count} folders, {file_count} files at root). Switching to fast folder-only mode.")
+                folder_only_mode = True
+                stats['scan_mode'] = 'folder_only'
+        
+        if folder_only_mode:
+            # Fast mode: Just calculate sizes per folder without detailed enumeration
+            return self._analyze_folder_only(path, stats, recursive)
+        
+        # Detailed mode: Full file enumeration (for smaller folders)
+        return self._analyze_detailed(path, stats, recursive)
+    
+    def _analyze_folder_only(self, path: str, stats: Dict, recursive: bool) -> Dict:
+        """Fast folder-only analysis mode for large directories."""
+        try:
+            # Get immediate subfolders
+            subfolders = []
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    if entry.is_dir(follow_symlinks=False):
+                        if not self.file_filter.should_exclude_folder(entry.name):
+                            subfolders.append(entry.path)
+            
+            stats['subfolder_count'] = len(subfolders)
+            
+            # Calculate size for each subfolder
+            for subfolder_path in subfolders:
+                try:
+                    # Use fast tree size calculation
+                    folder_size = self.get_tree_size_fast(subfolder_path)
+                    folder_name = os.path.basename(subfolder_path)
+                    
+                    stats['subfolders'].append({
+                        'name': folder_name,
+                        'path': subfolder_path,
+                        'size_bytes': folder_size,
+                        'size_gb': folder_size / (1024**3)
+                    })
+                    
+                    stats['total_size_bytes'] += folder_size
+                    
+                    # Log progress for large scans
+                    elapsed = time.time() - self.scan_start_time
+                    if elapsed > 5:  # Log every few seconds for long scans
+                        logger.info(f"Scanned {len(stats['subfolders'])}/{stats['subfolder_count']} folders...")
+                    
+                except (OSError, PermissionError) as e:
+                    logger.warning(f"Cannot access folder {subfolder_path}: {e}")
+                    continue
+            
+            # Also count files in root directory
+            root_size = 0
+            root_files = 0
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    if entry.is_file(follow_symlinks=False):
+                        if self.file_filter.should_include_file(entry.path):
+                            try:
+                                root_size += entry.stat(follow_symlinks=False).st_size
+                                root_files += 1
+                            except (OSError, PermissionError):
+                                continue
+            
+            stats['total_size_bytes'] += root_size
+            stats['total_files'] = root_files  # Note: This is only root files in folder-only mode
+            stats['file_types'] = {}  # Not enumerated in folder-only mode
+            
+        except (OSError, PermissionError) as e:
+            logger.error(f"Cannot access path {path}: {e}")
+        
+        stats['scan_duration'] = time.time() - self.scan_start_time
+        return stats
+    
+    def _analyze_detailed(self, path: str, stats: Dict, recursive: bool) -> Dict:
+        """Detailed analysis mode with full file enumeration."""
+        stats['scan_mode'] = 'detailed'
+        
+        # Use os.scandir for better performance than os.walk
+        if settings.ENABLE_FAST_SCAN:
+            return self._analyze_with_scandir(path, stats, recursive)
+        else:
+            # Legacy os.walk method
+            return self._analyze_with_walk(path, stats, recursive)
+    
+    def _analyze_with_scandir(self, path: str, stats: Dict, recursive: bool) -> Dict:
+        """Optimized analysis using os.scandir (faster than os.walk)."""
+        def scan_directory(current_path: str, is_root: bool = False):
+            try:
+                with os.scandir(current_path) as entries:
+                    dirs = []
+                    files = []
+                    
+                    for entry in entries:
+                        if entry.is_dir(follow_symlinks=False):
+                            if not self.file_filter.should_exclude_folder(entry.name):
+                                dirs.append(entry)
+                        else:
+                            files.append(entry)
+                    
+                    # Count subfolders at root level
+                    if is_root:
+                        stats['subfolder_count'] = len(dirs)
+                    
+                    # Process files
+                    for file_entry in files:
+                        if not self.file_filter.should_include_file(file_entry.path):
+                            continue
+                        
+                        try:
+                            file_size = file_entry.stat(follow_symlinks=False).st_size
+                            stats['total_files'] += 1
+                            stats['total_size_bytes'] += file_size
+                            
+                            # Track file types
+                            ext = os.path.splitext(file_entry.name)[1].lower()
+                            if not ext:
+                                ext = 'no_extension'
+                            stats['file_types'][ext] += 1
+                            
+                            if len(stats['preview_files']) < 20:
+                                stats['preview_files'].append(file_entry.path)
+                            
+                            # Check timeout
+                            if time.time() - self.scan_start_time > settings.SCAN_TIMEOUT_SECONDS:
+                                logger.warning(f"Scan timeout reached after {settings.SCAN_TIMEOUT_SECONDS}s")
+                                return False  # Signal timeout
+                            
+                        except (OSError, PermissionError):
+                            continue
+                    
+                    # Recurse into subdirectories if requested
+                    if recursive:
+                        for dir_entry in dirs:
+                            if scan_directory(dir_entry.path, is_root=False) is False:
+                                return False  # Propagate timeout
+                    
+                    return True
+                    
+            except (OSError, PermissionError) as e:
+                logger.warning(f"Cannot access directory {current_path}: {e}")
+                return True
+        
+        # Start scanning from root
+        scan_directory(path, is_root=True)
+        
+        stats['file_types'] = dict(stats['file_types'])
+        stats['scan_duration'] = time.time() - self.scan_start_time
+        return stats
+    
+    def _analyze_with_walk(self, path: str, stats: Dict, recursive: bool) -> Dict:
+        """Legacy analysis using os.walk (kept for compatibility)."""
+        # Walk through directory
+        for root, dirs, files in os.walk(path):
+            # Filter out excluded folders
+            dirs[:] = [d for d in dirs if not self.file_filter.should_exclude_folder(d)]
+            
+            # Count subfolders at first level
+            if root == path:
+                stats['subfolder_count'] = len(dirs)
+            
+            # Process files
+            for file in files:
+                filepath = os.path.join(root, file)
+                
+                # Check if file should be included
+                if not self.file_filter.should_include_file(filepath):
+                    continue
+                
+                try:
+                    file_size = os.path.getsize(filepath)
+                    stats['total_files'] += 1
+                    stats['total_size_bytes'] += file_size
+                    
+                    # Track file types
+                    ext = os.path.splitext(file)[1].lower()
+                    if not ext:
+                        ext = 'no_extension'
+                    stats['file_types'][ext] += 1
+                    
+                    # Add to preview (first 20 files)
+                    if len(stats['preview_files']) < 20:
+                        stats['preview_files'].append(filepath)
+                    
+                    # Check timeout
+                    if time.time() - self.scan_start_time > settings.SCAN_TIMEOUT_SECONDS:
+                        logger.warning(f"Scan timeout reached after {settings.SCAN_TIMEOUT_SECONDS}s")
+                        break
+                    
+                except (OSError, PermissionError):
+                    continue
+            
+            # Don't recurse if not requested
+            if not recursive:
+                break
+        
+        stats['file_types'] = dict(stats['file_types'])
+        stats['scan_duration'] = time.time() - self.scan_start_time
+        return stats
+    
+    def analyze_subfolders(self, path: str, folder_only_mode: bool = False) -> List[Dict]:
+        """Analyze each immediate subfolder separately.
+        
+        Args:
+            path: Parent directory path
+            folder_only_mode: If True, use fast folder-only scanning
+        
+        Returns:
+            List of subfolder statistics
+        """
+        subfolders = []
+        
+        try:
+            # Use scandir for better performance
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    if entry.is_dir(follow_symlinks=False):
+                        if not self.file_filter.should_exclude_folder(entry.name):
+                            try:
+                                subfolder_stats = self.analyze(entry.path, recursive=True, 
+                                                              folder_only_mode=folder_only_mode)
+                                subfolder_stats['name'] = entry.name
+                                subfolders.append(subfolder_stats)
+                                
+                                # Log progress
+                                logger.info(f"Analyzed subfolder: {entry.name} ({subfolder_stats.get('total_size_bytes', 0) / (1024**3):.2f} GB)")
+                            except Exception as e:
+                                logger.error(f"Error analyzing subfolder {entry.name}: {e}")
+        except (OSError, PermissionError) as e:
+            logger.error(f"Cannot access directory {path}: {e}")
+        
+        return subfolders
+
+
+class LocalAuditService:
+    """Service for local filesystem audits and recommendation generation."""
+
+    DOC_EXTENSIONS = {
+        '.doc', '.docx', '.pdf', '.txt', '.rtf', '.odt', '.xls', '.xlsx',
+        '.csv', '.ppt', '.pptx', '.md'
+    }
+    MEDIA_EXTENSIONS = {
+        '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tif', '.tiff', '.webp',
+        '.mp4', '.mov', '.avi', '.mkv', '.mp3', '.wav'
+    }
+    DATA_EXTENSIONS = {
+        '.json', '.xml', '.parquet', '.feather', '.avro', '.sqlite', '.db',
+        '.zip', '.gz', '.tar', '.7z', '.ndjson'
+    }
+    TEMP_EXTENSIONS = {'.tmp', '.temp', '.bak', '.old', '.log', '.dmp', '.cache'}
+
+    @staticmethod
+    def _all_files_filter() -> FileFilter:
+        return FileFilter(
+            include_patterns=[r'^.*$'],
+            exclude_patterns=[],
+            exclude_folders=[]
+        )
+
+    @staticmethod
+    def validate_windows_local_path(path: str) -> str:
+        """Validate and normalize a Windows local drive/folder path."""
+        raw = (path or '').strip().strip('"').strip("'")
+        if not raw:
+            raise ValueError("Path is required")
+
+        normalized = os.path.normpath(raw)
+
+        # Reject UNC/network paths for v1.
+        if normalized.startswith('\\\\'):
+            raise ValueError("UNC/network paths are not supported in v1")
+
+        # Require local drive paths like C:\\ or D:\\folder.
+        if not re.match(r'^[A-Za-z]:\\', normalized + ('\\' if re.match(r'^[A-Za-z]:$', normalized) else '')):
+            raise ValueError("Path must be a local Windows drive or folder (example: T:\\\\)")
+
+        if re.match(r'^[A-Za-z]:$', normalized):
+            normalized = normalized + '\\'
+
+        if not os.path.exists(normalized):
+            raise ValueError(f"Path does not exist: {normalized}")
+        if not os.path.isdir(normalized):
+            raise ValueError(f"Path is not a directory: {normalized}")
+
+        return normalized
+
+    @classmethod
+    def categorize_extension(cls, extension: str) -> str:
+        ext = (extension or '').lower()
+        if ext in cls.DOC_EXTENSIONS:
+            return 'docs'
+        if ext in cls.MEDIA_EXTENSIONS:
+            return 'media'
+        if ext in cls.DATA_EXTENSIONS:
+            return 'data'
+        if ext in cls.TEMP_EXTENSIONS:
+            return 'temp'
+        return 'other'
+
+    @classmethod
+    def _safe_file_info(cls, file_path: str):
+        try:
+            stat = os.stat(file_path)
+            modified = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+            age_days = int((datetime.now(timezone.utc) - modified).total_seconds() // 86400)
+            extension = os.path.splitext(file_path)[1].lower() or 'no_extension'
+            return {
+                'size_bytes': float(stat.st_size or 0.0),
+                'modified_at': modified,
+                'age_days': max(age_days, 0),
+                'extension': extension,
+                'file_category': cls.categorize_extension(extension),
+                'is_temp': cls.categorize_extension(extension) == 'temp',
+            }
+        except (OSError, PermissionError):
+            return None
+
+    @classmethod
+    def run_scan(cls, target_path: str, recursive: bool = True) -> Dict:
+        """Run a local audit and return summary, folder breakdown, and detailed findings."""
+        normalized_path = cls.validate_windows_local_path(target_path)
+        started = time.time()
+        skipped_permissions = 0
+
+        analyzer = FolderAnalyzer(file_filter=cls._all_files_filter())
+        summary = analyzer.analyze(normalized_path, recursive=recursive)
+
+        top_level_folders = []
+        root_file_types = defaultdict(int)
+        root_files = 0
+        root_size = 0.0
+
+        try:
+            with os.scandir(normalized_path) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            folder_stats = analyzer.analyze(entry.path, recursive=True)
+                            top_level_folders.append({
+                                'name': entry.name,
+                                'path': entry.path,
+                                'total_files': int(folder_stats.get('total_files', 0)),
+                                'total_size_bytes': float(folder_stats.get('total_size_bytes', 0.0)),
+                                'file_types': folder_stats.get('file_types', {}),
+                                'scan_mode': folder_stats.get('scan_mode', 'detailed'),
+                            })
+                        elif entry.is_file(follow_symlinks=False):
+                            info = cls._safe_file_info(entry.path)
+                            if info:
+                                root_files += 1
+                                root_size += info['size_bytes']
+                                root_file_types[info['extension']] += 1
+                    except (OSError, PermissionError):
+                        skipped_permissions += 1
+                        continue
+        except (OSError, PermissionError):
+            skipped_permissions += 1
+
+        top_level_folders.append({
+            'name': '(root)',
+            'path': normalized_path,
+            'total_files': root_files,
+            'total_size_bytes': root_size,
+            'file_types': dict(root_file_types),
+            'scan_mode': 'detailed',
+        })
+
+        top_level_folders.sort(key=lambda row: float(row.get('total_size_bytes', 0.0)), reverse=True)
+
+        detailed_cap = int(settings.LOCAL_AUDIT_MAX_DETAILED_FILES)
+        timeout_seconds = int(settings.LOCAL_AUDIT_SCAN_MAX_SECONDS)
+        detailed_findings = []
+        detailed_truncated = False
+
+        def _on_walk_error(_err):
+            nonlocal skipped_permissions
+            skipped_permissions += 1
+
+        for root, _dirs, files in os.walk(normalized_path, onerror=_on_walk_error):
+            if not recursive and root != normalized_path:
+                continue
+
+            for file_name in files:
+                if len(detailed_findings) >= detailed_cap:
+                    detailed_truncated = True
+                    break
+
+                if time.time() - started > timeout_seconds:
+                    detailed_truncated = True
+                    break
+
+                file_path = os.path.join(root, file_name)
+                info = cls._safe_file_info(file_path)
+                if not info:
+                    skipped_permissions += 1
+                    continue
+
+                relative_path = os.path.relpath(file_path, normalized_path)
+                first_part = relative_path.split(os.sep, 1)[0]
+                top_level_folder = '(root)' if first_part == file_name else first_part
+
+                detailed_findings.append({
+                    'top_level_folder': top_level_folder,
+                    'relative_path': relative_path,
+                    'file_name': file_name,
+                    'extension': info['extension'],
+                    'file_category': info['file_category'],
+                    'size_bytes': info['size_bytes'],
+                    'modified_at': info['modified_at'],
+                    'age_days': info['age_days'],
+                    'is_temp': info['is_temp'],
+                })
+
+            if detailed_truncated:
+                break
+
+        recommendations = cls.generate_recommendations(
+            total_files=int(summary.get('total_files', 0)),
+            total_size_bytes=float(summary.get('total_size_bytes', 0.0)),
+            file_types=summary.get('file_types', {}) or {},
+            findings=detailed_findings,
+            top_level_folders=top_level_folders,
+        )
+
+        return {
+            'target_path': normalized_path,
+            'summary': summary,
+            'top_level_folders': top_level_folders,
+            'detailed_findings': detailed_findings,
+            'detailed_truncated': detailed_truncated,
+            'max_detailed_files': detailed_cap,
+            'skip_permission_count': skipped_permissions,
+            'scan_duration_seconds': round(time.time() - started, 2),
+            'recommendations': recommendations,
+        }
+
+    @classmethod
+    def generate_recommendations(
+        cls,
+        total_files: int,
+        total_size_bytes: float,
+        file_types: Dict[str, int],
+        findings: List[Dict],
+        top_level_folders: List[Dict],
+    ) -> List[Dict]:
+        """Generate read-only recommendations based on scan stats."""
+        recommendations = []
+        safe_total_files = max(total_files, 1)
+
+        temp_count = 0
+        docs_count = 0
+        media_data_count = 0
+        for extension, count in (file_types or {}).items():
+            category = cls.categorize_extension(extension)
+            if category == 'temp':
+                temp_count += int(count or 0)
+            elif category == 'docs':
+                docs_count += int(count or 0)
+            elif category in {'media', 'data'}:
+                media_data_count += int(count or 0)
+
+        if temp_count > 0:
+            temp_pct = (temp_count / safe_total_files) * 100
+            recommendations.append({
+                'kind': 'cleanup_temp_files',
+                'priority': 'high' if temp_pct >= 10 else 'medium',
+                'title': 'Review temporary/junk files for cleanup',
+                'reason': f'{temp_count} temporary-like files detected ({temp_pct:.1f}% of scanned files).',
+            })
+
+        docs_ratio = docs_count / safe_total_files
+        if docs_ratio >= float(settings.LOCAL_AUDIT_DOCS_DOMINANCE_PCT):
+            recommendations.append({
+                'kind': 'docs_to_shared_drive',
+                'priority': 'medium',
+                'title': 'Consider moving document-heavy content to Google Shared Drive',
+                'reason': f'Documents represent {docs_ratio * 100:.1f}% of scanned files.',
+            })
+
+        media_ratio = media_data_count / safe_total_files
+        if media_ratio >= float(settings.LOCAL_AUDIT_MEDIA_DOMINANCE_PCT):
+            recommendations.append({
+                'kind': 'media_data_to_gcs',
+                'priority': 'medium',
+                'title': 'Consider moving media/data-heavy content to Google Cloud Storage buckets',
+                'reason': f'Media/data files represent {media_ratio * 100:.1f}% of scanned files.',
+            })
+
+        archive_age_days = int(settings.LOCAL_AUDIT_ARCHIVE_AGE_DAYS)
+        archive_min_size_bytes = int(settings.LOCAL_AUDIT_ARCHIVE_MIN_SIZE_MB) * 1024 * 1024
+        old_large = [
+            item for item in findings
+            if int(item.get('age_days', 0)) >= archive_age_days
+            and float(item.get('size_bytes', 0.0)) >= archive_min_size_bytes
+        ]
+        if old_large:
+            old_large_bytes = sum(float(item.get('size_bytes', 0.0)) for item in old_large)
+            recommendations.append({
+                'kind': 'archive_large_old_files',
+                'priority': 'medium',
+                'title': 'Archive large and old files',
+                'reason': (
+                    f'{len(old_large)} files are older than {archive_age_days} days '
+                    f'and larger than {settings.LOCAL_AUDIT_ARCHIVE_MIN_SIZE_MB} MB '
+                    f'({old_large_bytes / (1024**3):.2f} GB total).'
+                ),
+            })
+
+        if not recommendations:
+            recommendations.append({
+                'kind': 'no_action_needed',
+                'priority': 'low',
+                'title': 'No immediate optimization recommendations',
+                'reason': (
+                    f'Scanned {total_files} files totaling {total_size_bytes / (1024**3):.2f} GB '
+                    'without crossing current recommendation thresholds.'
+                ),
+            })
+
+        # Provide folder-level hint for top storage contributors.
+        heavy_folders = [f for f in top_level_folders if f.get('name') != '(root)']
+        heavy_folders = sorted(heavy_folders, key=lambda row: float(row.get('total_size_bytes', 0.0)), reverse=True)[:3]
+        if heavy_folders:
+            recommendations.append({
+                'kind': 'top_folders_for_review',
+                'priority': 'low',
+                'title': 'Prioritize largest folders for in-depth review',
+                'reason': ', '.join(
+                    f"{row['name']} ({float(row.get('total_size_bytes', 0.0)) / (1024**3):.2f} GB)"
+                    for row in heavy_folders
+                ),
+            })
+
+        return recommendations
+
+# Progress line patterns for gcloud storage rsync output (Issue #12)
+_PROGRESS_RE = re.compile(
+    r'Completed\s+([\d.]+)\s*(B|KiB|MiB|GiB)\s*/\s*([\d.]+)\s*(B|KiB|MiB|GiB)'
+)
+_FILES_RE = re.compile(r'Operation completed over (\d+) objects')
+
+def _to_bytes(val: float, unit: str) -> float:
+    return val * {'B': 1, 'KiB': 1024, 'MiB': 1024**2, 'GiB': 1024**3}[unit]
+
+def _parse_progress(line: str, callback: Callable) -> None:
+    """Parse a gcloud/gsutil output line and invoke callback with progress."""
+    m = _PROGRESS_RE.search(line)
+    if m:
+        callback(
+            bytes_uploaded=_to_bytes(float(m.group(1)), m.group(2)),
+            total_bytes=_to_bytes(float(m.group(3)), m.group(4))
+        )
+    mf = _FILES_RE.search(line)
+    if mf:
+        callback(files_uploaded=int(mf.group(1)))
+
+def make_progress_callback(job_id: str, db=None) -> Callable:
+    """Return a throttled progress callback that updates the job in the database.
+
+    Runs on the subprocess reader thread, so each write uses its own short-lived
+    session instead of sharing the job runner's session across threads. ``db`` is
+    accepted for backward compatibility and only used if no session factory exists.
+    """
+    last_write = [0.0]
+
+    def callback(bytes_uploaded=None, total_bytes=None, files_uploaded=None, total_files=None):
+        now = time.time()
+        # New totals are always written; plain progress at most every 2 s.
+        if total_files is None and now - last_write[0] < 2.0:
+            return
+        last_write[0] = now
+        from . import database
+        session = database.SessionLocal() if database.SessionLocal is not None else db
+        if session is None:
+            return
+        try:
+            values = {}
+            if bytes_uploaded is not None:
+                values[UploadJob.bytes_uploaded] = bytes_uploaded
+            if total_bytes and total_bytes > 0:
+                values[UploadJob.total_size_bytes] = total_bytes
+            if files_uploaded is not None:
+                values[UploadJob.files_uploaded] = files_uploaded
+            if total_files is not None:
+                values[UploadJob.total_files] = total_files
+            if values:
+                session.query(UploadJob).filter(UploadJob.job_id == job_id).update(
+                    values, synchronize_session=False
+                )
+                session.commit()
+                notify_job(job_id)
+        except Exception:
+            try:
+                session.rollback()
+            except Exception:
+                pass
+        finally:
+            if session is not db:
+                session.close()
+
+    return callback
+
+
+def _relative_to(path: str, root: str) -> str:
+    """Path relative to the upload's source folder, with '/' separators."""
+    normalized = path.replace("\\", "/")
+    base = (root or "").replace("\\", "/").rstrip("/") + "/"
+    return normalized[len(base):] if normalized.startswith(base) else normalized
+
+
+def find_transfer_engine() -> Optional[str]:
+    """Path to the jetstream-transfer engine, or None if it isn't installed.
+
+    Looks at JETSTREAM_TRANSFER_BIN, next to the running executable (the desktop app
+    bundles it beside the server), on PATH, and in a source checkout's build output.
+    """
+    exe = "jetstream-transfer.exe" if sys.platform == "win32" else "jetstream-transfer"
+    override = os.environ.get("JETSTREAM_TRANSFER_BIN")
+    candidates = [override] if override else []
+    candidates.append(os.path.join(os.path.dirname(sys.executable), exe))
+    on_path = shutil.which("jetstream-transfer")
+    if on_path:
+        candidates.append(on_path)
+    repo_build = Path(__file__).resolve().parent.parent / "desktop" / "transfer" / "target"
+    candidates += [str(repo_build / "release" / exe), str(repo_build / "debug" / exe)]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+ENGINE_STOP_GRACE_SECONDS = 15
+
+
+class JobActivity:
+    """Recent per-file activity of a running upload, for the live "files" view."""
+
+    MAX_RECENT = 25
+
+    def __init__(self, tool: str):
+        self.tool = tool
+        self.recent: deque = deque(maxlen=self.MAX_RECENT)
+        self.in_flight: Dict[str, Dict] = {}
+        self.files_done = 0
+        self.failed = 0
+        self.paused = False
+        # Waiting for the internet connection to come back (time.time() when it dropped).
+        self.offline_since: Optional[float] = None
+        # Engine phase: scanning, listing, uploading; with what it has checked so far.
+        self.phase: Optional[str] = None
+        self.checking: Dict = {}
+        self.retrying: Dict[str, Dict] = {}
+        self._lock = threading.Lock()
+
+    def started(self, path: str, size: Optional[int] = None, parts: Optional[int] = None) -> None:
+        with self._lock:
+            self.in_flight[path] = {"path": path, "bytes": size, "started_at": time.time(), "parts": parts}
+
+    def retry(self, path: str, attempt: int, max_attempts: int, error: str) -> None:
+        with self._lock:
+            self.retrying[path] = {"attempt": attempt, "max_attempts": max_attempts, "error": error}
+            self.in_flight.setdefault(path, {"path": path, "bytes": None, "started_at": time.time()})
+
+    def finished(self, path: str, size: Optional[int] = None, error: Optional[str] = None) -> None:
+        with self._lock:
+            self.retrying.pop(path, None)
+            started = self.in_flight.pop(path, None)
+            if size is None and started:
+                size = started.get("bytes")
+            if error:
+                self.failed += 1
+            else:
+                self.files_done += 1
+            self.recent.appendleft({"path": path, "bytes": size, "at": time.time(), "error": error})
+
+    def snapshot(self) -> Dict:
+        with self._lock:
+            now = time.time()
+            return {
+                "tool": self.tool,
+                "paused": self.paused,
+                "offline": self.offline_since is not None,
+                "offline_seconds": round(now - self.offline_since) if self.offline_since else 0,
+                "phase": self.phase,
+                "checking": dict(self.checking),
+                "files_done": self.files_done,
+                "failed": self.failed,
+                "in_flight": [
+                    {**item, "seconds": round(now - item["started_at"], 1), "retry": self.retrying.get(item["path"])}
+                    for item in self.in_flight.values()
+                ],
+                "recent": [{**item, "seconds_ago": round(now - item["at"], 1)} for item in self.recent],
+            }
+
+
+_job_activity: "Dict[str, JobActivity]" = {}
+_job_activity_lock = threading.Lock()
+
+
+def start_job_activity(job_id: str, tool: str) -> JobActivity:
+    """Fresh activity record for a job run (keeps the 50 most recent jobs)."""
+    with _job_activity_lock:
+        activity = JobActivity(tool)
+        _job_activity.pop(job_id, None)
+        _job_activity[job_id] = activity
+        while len(_job_activity) > 50:
+            _job_activity.pop(next(iter(_job_activity)))
+        return activity
+
+
+def job_activity_object(job_id: str) -> Optional[JobActivity]:
+    with _job_activity_lock:
+        return _job_activity.get(job_id)
+
+
+def job_activity(job_id: str) -> Optional[Dict]:
+    with _job_activity_lock:
+        activity = _job_activity.get(job_id)
+    return activity.snapshot() if activity else None
+
+
+async def count_job_files(job: UploadJob) -> bool:
+    """Count a job's files before a gcloud/gsutil upload, so its progress has a total.
+
+    Runs in a worker thread (the server keeps answering) and shows "counting" with a running
+    count on the job's activity. The JetStream engine counts for itself, and jobs that already
+    know their totals skip this. Returns False if the job was cancelled meanwhile.
+    """
+    tool = getattr(job, "upload_tool", None) or "gcloud"
+    if job.total_files or tool == "jetstream":
+        return True
+    job_id = job.job_id
+    activity = start_job_activity(job_id, tool)
+    activity.phase = "counting"
+    activity.checking = {"counted_files": 0, "counted_bytes": 0}
+    filters = job.filters or {}
+    file_filter = FileFilter(include_patterns=None, exclude_patterns=filters.get("exclude_patterns"),
+                             exclude_folders=filters.get("exclude_folders"))
+
+    def on_progress(files: int, size: int) -> None:
+        activity.checking = {"counted_files": files, "counted_bytes": size}
+
+    upload_service.stop_requested.discard(job_id)
+    files, size = await asyncio.to_thread(
+        count_files, job.source_path, bool(job.recursive), file_filter, on_progress,
+        lambda: job_id in upload_service.stop_requested,
+    )
+    if job_id in upload_service.stop_requested:
+        upload_service.stop_requested.discard(job_id)
+        return False
+    from . import database
+    session = database.SessionLocal() if database.SessionLocal is not None else None
+    if session is not None:
+        try:
+            session.query(UploadJob).filter(UploadJob.job_id == job_id).update(
+                {UploadJob.total_files: files, UploadJob.total_size_bytes: size}, synchronize_session=False)
+            session.commit()
+            current = session.query(UploadJob.status).filter(UploadJob.job_id == job_id).scalar()
+        finally:
+            session.close()
+        notify_job(job_id)
+        if current == "cancelled":
+            return False
+    job.total_files, job.total_size_bytes = files, size
+    activity.phase = None
+    return True
+
+
+# "Copying file://C:\data\a.jpg to gs://bucket/a.jpg" (gcloud) / "Copying file://... [Content-Type=...]" (gsutil)
+_COPY_LINE_RE = re.compile(r"Copying file://(.+?)(?: to gs://| \[Content-Type)")
+
+
+class EngineRunState:
+    """Turns jetstream-transfer JSON events into job progress and a readable summary."""
+
+    def __init__(self):
+        self.base_bytes = 0      # bytes already in the cloud before this run (unchanged files)
+        self.base_files = 0
+        self.total_bytes = 0
+        self.summary: Optional[Dict] = None
+        self.failures: List[str] = []
+        self.failure_count = 0
+        self.error: Optional[str] = None
+        self.dry_run = False
+        self.activity: Optional[JobActivity] = None
+        self.online_only: List[str] = []
+        self.offline_events = 0
+        self.offline_seconds = 0
+        self.composite_off: Optional[str] = None
+
+    def handle(self, line: str, progress_callback: Optional[Callable]) -> None:
+        import json
+        try:
+            event = json.loads(line)
+        except ValueError:
+            return
+        kind = event.get("event")
+        if kind == "start":
+            self.dry_run = bool(event.get("dry_run"))
+        elif kind == "phase":
+            if self.activity is not None:
+                self.activity.phase = event.get("phase")
+        elif kind == "composite_off":
+            self.composite_off = event.get("reason") or ""
+        elif kind == "offline":
+            if self.activity is not None and self.activity.offline_since is None:
+                self.activity.offline_since = time.time()
+            self.offline_events += 1
+        elif kind == "online":
+            if self.activity is not None:
+                self.activity.offline_since = None
+            self.offline_seconds += int(event.get("offline_seconds") or 0)
+        elif kind == "file_retrying":
+            if self.activity is not None:
+                self.activity.retry(event.get("path"), int(event.get("attempt") or 0),
+                                    int(event.get("max_attempts") or 0), event.get("error") or "")
+        elif kind == "plan":
+            self.total_bytes = int(event.get("local_bytes") or 0)
+            self.base_bytes = self.total_bytes - int(event.get("to_check_bytes") or 0)
+            self.base_files = int(event.get("local_files") or 0) - int(event.get("to_check") or 0)
+            if progress_callback:
+                progress_callback(bytes_uploaded=self.base_bytes, total_bytes=self.total_bytes,
+                                  files_uploaded=self.base_files,
+                                  total_files=int(event.get("local_files") or 0))
+        elif kind == "progress":
+            if self.activity is not None:
+                self.activity.paused = bool(event.get("paused"))
+                if event.get("offline") and self.activity.offline_since is None:
+                    self.activity.offline_since = time.time()
+                elif not event.get("offline"):
+                    self.activity.offline_since = None
+                if event.get("phase"):
+                    self.activity.phase = event.get("phase")
+                self.activity.checking = {
+                    "listed_objects": int(event.get("listed_objects") or 0),
+                    "hashed_files": int(event.get("hashed_files") or 0),
+                    "hashed_bytes": int(event.get("hashed_bytes") or 0),
+                    "files_done": int(event.get("files_done") or 0),
+                    "files_total": int(event.get("files_total") or 0),
+                }
+            if not progress_callback:
+                return
+            progress_callback(
+                bytes_uploaded=self.base_bytes + int(event.get("bytes_done") or 0),
+                total_bytes=self.total_bytes,
+                files_uploaded=self.base_files + int(event.get("files_done") or 0),
+            )
+        elif kind == "file_started":
+            if self.activity:
+                self.activity.started(event.get("path"), event.get("bytes"), event.get("parts"))
+        elif kind in ("file_uploaded", "file_would_upload"):
+            if self.activity:
+                self.activity.finished(event.get("path"), event.get("bytes"))
+        elif kind == "file_skipped":
+            reason = event.get("reason") or ""
+            if "online-only" in reason:
+                self.online_only.append(event.get("path"))
+        elif kind == "file_failed":
+            self.failure_count += 1
+            if len(self.failures) < 20:
+                self.failures.append(f"{event.get('path')}: {event.get('error')}")
+            if self.activity:
+                self.activity.finished(event.get("path"), error=event.get("error"))
+        elif kind == "done":
+            self.summary = event
+        elif kind == "error":
+            self.error = event.get("error")
+
+    def summary_text(self, returncode: Optional[int]) -> str:
+        if self.summary is None:
+            return f"Upload engine failed: {self.error or f'exit code {returncode}'}"
+        s = self.summary
+        mb = lambda n: f"{(n or 0) / (1024 * 1024):.1f} MB"
+        if self.dry_run:
+            head = f"Preview: {s.get('would_upload', 0)} file(s), {mb(s.get('would_upload_bytes'))} would be uploaded."
+        else:
+            head = f"Uploaded {s.get('uploaded', 0)} file(s), {mb(s.get('uploaded_bytes'))}."
+        already = f"Already in cloud: {s.get('already_in_cloud', 0)}"
+        if s.get("matched_by_time"):
+            already += f" ({s['matched_by_time']} recognised by size and date, without reading them)"
+        lines = [
+            head,
+            f"Unchanged: {s.get('unchanged', 0)}  |  {already}  |  "
+            f"Resumed: {s.get('resumed', 0)}  |  Skipped (exists): {s.get('skipped_exists', 0)}  |  "
+            f"Excluded: {s.get('excluded', 0)}",
+            f"Failed: {s.get('failed', 0)}  |  Unreadable: {s.get('unreadable', 0)}  |  "
+            f"Files read to check: {s.get('hashed_files', 0)}  |  Time: {s.get('elapsed_seconds', 0)} s",
+        ]
+        if s.get("online_only"):
+            lines.append(
+                f"Skipped {s['online_only']} online-only file(s) (OneDrive or another cloud drive): their content isn't on "
+                "this computer. Right-click the folder and choose \"Always keep on this device\", then sync again."
+            )
+            lines.extend(f"  {p}" for p in self.online_only[:10])
+        if s.get("composite_files"):
+            lines.append(f"Large files uploaded as parallel parts and joined in the bucket: {s['composite_files']}")
+        if s.get("parts_left"):
+            lines.append(
+                f"{s['parts_left']} temporary part(s) couldn't be deleted after joining; they're under "
+                "_jetstream/parts/ in the destination and can be deleted."
+            )
+        if self.composite_off:
+            lines.append(f"Large files went up as one stream each: {self.composite_off}.")
+        if self.offline_events:
+            lines.append(
+                f"The internet connection dropped {self.offline_events} time(s) ({self.offline_seconds} s in all); "
+                "uploads waited and carried on when it came back."
+            )
+        if s.get("cancelled"):
+            lines.append("Stopped before finishing. Everything uploaded so far is kept; run the job again to continue.")
+        if self.failures:
+            lines.append("Failed files:")
+            lines.extend(f"  {f}" for f in self.failures)
+            if self.failure_count > len(self.failures):
+                lines.append(f"  ... and {self.failure_count - len(self.failures)} more")
+        return "\n".join(lines)
+
+
+def list_upload_tools() -> List[Dict]:
+    """Upload tools the user can choose from, with availability on this computer."""
+    gcloud = find_gcloud()
+    engine = find_transfer_engine()
+    return [
+        {
+            "id": "gcloud",
+            "label": "gcloud storage rsync",
+            "description": "Google's standard tool. Recommended default.",
+            "available": gcloud is not None,
+            "detail": None if gcloud else "Google Cloud SDK (gcloud) is not installed.",
+        },
+        {
+            "id": "jetstream",
+            "label": "JetStream engine (beta)",
+            "description": "Near-instant re-syncs of unchanged folders, resumes large files after interruptions, "
+                           "uses much less CPU.",
+            "available": engine is not None,
+            "detail": None if engine else "Included with the JetStream desktop app.",
+        },
+        {
+            "id": "gsutil",
+            "label": "gsutil rsync (legacy)",
+            "description": "Older Google tool, kept for compatibility.",
+            "available": shutil.which("gsutil") is not None,
+            "detail": None if shutil.which("gsutil") else "gsutil is not installed.",
+        },
+    ]
+
+
+def claim_job_for_run(db, job_id: str) -> bool:
+    """Atomically move a pending/queued job to running.
+
+    Both the upload router and the scheduler can try to start the same queued
+    job; only the caller whose UPDATE matches the row gets to run it.
+    """
+    claimed = db.query(UploadJob).filter(
+        UploadJob.job_id == job_id,
+        UploadJob.status.in_(["pending", "queued"]),
+    ).update(
+        {UploadJob.status: "running", UploadJob.started_at: datetime.now(timezone.utc)},
+        synchronize_session=False,
+    )
+    db.commit()
+    if claimed == 1:
+        notify_job(job_id)
+    return claimed == 1
+
+
+class UploadService:
+    """Handle Google Cloud Storage uploads."""
+    
+    def __init__(self):
+        self.active_uploads = {}  # Track active upload processes
+        self.stop_requested = set()  # Jobs cancelled while counting their files
+        self.engine_jobs = set()  # Jobs run by the JetStream engine (can pause / change speed)
+        self.upload_results = {}  # job_id -> what the engine actually uploaded (see take_result)
+    
+    async def upload_to_gcs(self, job_id: str, source_path: str,
+                           destination_bucket: str, destination_path: str = "",
+                           dry_run: bool = False, recursive: bool = True,
+                           threads: int = 4, log_path: str = None, upload_tool: str = "gcloud",
+                           exclude_patterns: list = None, exclude_folders: list = None,
+                           no_clobber: bool = False, progress_callback: Callable = None) -> bool:
+        """Upload files to Google Cloud Storage using gcloud storage or gsutil."""
+        
+        # Strip bucket name from destination_path if it starts with it
+        # This handles cases where users paste paths from GCS console that include the bucket
+        if destination_path:
+            path_parts = destination_path.strip('/').split('/', 1)
+            if path_parts[0] == destination_bucket:
+                destination_path = path_parts[1] if len(path_parts) > 1 else ""
+                print(f"ℹ️  Stripped bucket name from path. Using: {destination_path}")
+        
+        # Construct GCS path
+        gcs_path = f"gs://{destination_bucket}"
+        if destination_path:
+            gcs_path = f"{gcs_path}/{destination_path.strip('/')}"
+        
+        # Helper to convert glob patterns to regex for gsutil/gcloud
+        def glob_to_regex(pattern: str) -> str:
+            """Convert a glob pattern to regex for gsutil/gcloud exclude."""
+            # Detect if pattern is already a regex (has regex-specific syntax)
+            regex_indicators = ['|', '(', ')', '^', '$', '\\', '{', '}', '[', ']', '+', '(?']
+            is_likely_regex = any(indicator in pattern for indicator in regex_indicators)
+            
+            if is_likely_regex:
+                # Already a regex pattern - pass through unchanged
+                return pattern
+            elif pattern.startswith('*.'):
+                # *.tmp -> .*\.tmp$
+                ext = pattern[2:]
+                return r'.*\.' + re.escape(ext) + r'$'
+            elif pattern.startswith('*'):
+                # *something -> .*something$
+                return r'.*' + re.escape(pattern[1:]) + r'$'
+            elif pattern.endswith('*'):
+                # something* -> ^something.*
+                return r'^' + re.escape(pattern[:-1]) + r'.*'
+            elif '*' in pattern:
+                # General glob: convert * to .*
+                result = re.escape(pattern)
+                result = result.replace(r'\*', '.*')
+                return result
+            else:
+                # Exact filename match (e.g., Thumbs.db)
+                return re.escape(pattern)
+        
+        # Convert user patterns (which may be glob) to regex for the upload tools
+        all_exclude_patterns = []
+        if exclude_patterns:
+            for pattern in exclude_patterns:
+                all_exclude_patterns.append(glob_to_regex(pattern))
+        
+        # Add exclude_folders as regex patterns
+        if exclude_folders:
+            for folder in exclude_folders:
+                # Convert folder name to regex pattern that matches the folder anywhere in path
+                # Pattern matches: folder/ or /folder/ anywhere in the path
+                all_exclude_patterns.append(f".*/{re.escape(folder)}/.*")
+                all_exclude_patterns.append(f"^{re.escape(folder)}/.*")
+        
+        if upload_tool == "jetstream":
+            return await self._upload_with_engine(
+                job_id=job_id, source_path=source_path, gcs_path=gcs_path, dry_run=dry_run,
+                recursive=recursive, log_path=log_path, exclude_patterns=all_exclude_patterns,
+                no_clobber=no_clobber, progress_callback=progress_callback,
+            )
+
+        # Build command based on selected tool
+        if upload_tool == "gsutil":
+            # Build gsutil command
+            cmd = ["gsutil", "-m", "rsync"]
+            
+            if dry_run:
+                cmd.append("-n")  # Dry run
+            
+            if recursive:
+                cmd.append("-r")  # Recursive
+            
+            # Add exclude patterns for gsutil (uses -x with regex)
+            # Combine multiple patterns with | alternation
+            if all_exclude_patterns:
+                combined_pattern = "|".join(f"({p})" for p in all_exclude_patterns)
+                cmd.extend(["-x", combined_pattern])
+        else:
+            # Build gcloud storage rsync command (default)
+            cmd = ["gcloud", "storage", "rsync"]
+            
+            if dry_run:
+                cmd.append("--dry-run")  # Dry run
+            
+            if recursive:
+                cmd.append("--recursive")  # Recursive
+            
+            # Use checksums to determine if files need updating (more reliable than timestamps)
+            cmd.append("--checksums-only")
+
+            # Skip files that already exist in the bucket (Issue #13)
+            if no_clobber:
+                cmd.append("--no-clobber")
+
+            # Add exclude patterns for gcloud storage
+            # Combine multiple patterns with | alternation
+            if all_exclude_patterns:
+                combined_pattern = "|".join(f"({p})" for p in all_exclude_patterns)
+                cmd.append(f"--exclude={combined_pattern}")
+        
+        cmd.extend([source_path, gcs_path])
+        
+        # Build shell command string with proper quoting for all arguments
+        # Always quote paths to handle spaces and special characters
+        shell_cmd_parts = []
+        for i, arg in enumerate(cmd):
+            # Quote paths (source and destination are last two args) and args with spaces
+            if i >= len(cmd) - 2 or ' ' in str(arg) or '\\' in str(arg):
+                shell_cmd_parts.append(f'"{arg}"')
+            else:
+                shell_cmd_parts.append(arg)
+        
+        shell_cmd = ' '.join(shell_cmd_parts)
+        display_shell_cmd = redact_sensitive_text(shell_cmd)
+        print(f"🚀 Executing: {display_shell_cmd}")
+        
+        def write_log_header(f, title: str):
+            f.write("="*80 + "\n")
+            f.write(f"{title}\n")
+            f.write("="*80 + "\n\n")
+            friendly_name = os.path.basename(log_path).replace('.log', '')
+            f.write(f"Job Name:        {friendly_name}\n")
+            f.write(f"Job ID:          {job_id}\n")
+            f.write(f"Timestamp:       {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"\n")
+            f.write(f"Source Path:     {source_path}\n")
+            f.write(f"Destination:     {gcs_path}\n")
+            f.write(f"Dry Run:         {dry_run}\n")
+            f.write(f"Recursive:       {recursive}\n")
+            f.write(f"\n")
+            f.write(f"Command:         {display_shell_cmd}\n")
+
+        def open_log():
+            """Open the job log for streaming; returns None if it cannot be written."""
+            if not log_path:
+                return None
+            try:
+                os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                f = open(log_path, 'w', encoding='utf-8')
+                write_log_header(f, "JETSTREAM UPLOAD JOB LOG")
+                f.write("\n" + "="*80 + "\n")
+                f.write("COMMAND OUTPUT\n")
+                f.write("="*80 + "\n\n")
+                f.flush()
+                return f
+            except Exception as log_error:
+                print(f"⚠ Warning: Could not open log file: {log_error}")
+                return None
+
+        log_file = None
+        try:
+            # Windows doesn't support asyncio subprocess properly, so we use thread pool
+            import subprocess
+
+            log_file = open_log()
+            capture = OutputCapture(log_file=log_file)
+            activity = start_job_activity(job_id, upload_tool)
+            echo = ConsoleEcho()
+
+            def run_subprocess():
+                """Run subprocess synchronously in thread, streaming output in real-time.
+
+                Uses two threads to read stdout and stderr concurrently to prevent
+                OS pipe buffer deadlocks when both streams produce large output.
+                Output goes to the log file as it arrives; only a bounded tail is
+                kept in memory.
+                """
+                process = subprocess.Popen(
+                    shell_cmd,
+                    shell=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    # Never let an undecodable file name in gcloud's output stop the reader.
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    universal_newlines=True
+                )
+                self.active_uploads[job_id] = process
+
+                def _read_stdout():
+                    for line in process.stdout:
+                        capture.add(line, "stdout")
+
+                def _read_stderr():
+                    for line in process.stderr:
+                        capture.add(line, "stderr")
+                        echo(line)
+                        if progress_callback:
+                            _parse_progress(line, progress_callback)
+                        copied = _COPY_LINE_RE.search(line)
+                        if copied:
+                            activity.finished(_relative_to(copied.group(1), source_path))
+
+                t1 = threading.Thread(target=_read_stdout, daemon=True)
+                t2 = threading.Thread(target=_read_stderr, daemon=True)
+                t1.start()
+                t2.start()
+                t1.join()
+                t2.join()
+                process.wait()
+
+                return process.returncode
+
+            # Run in thread pool to avoid blocking
+            returncode = await asyncio.to_thread(run_subprocess)
+
+            # Remove from active uploads
+            if job_id in self.active_uploads:
+                del self.active_uploads[job_id]
+
+            # Bounded output summary for database storage
+            output = capture.summary()
+
+            if log_file is not None:
+                try:
+                    log_file.write("\n" + "="*80 + "\n")
+                    log_file.write(f"Return Code:     {returncode}\n")
+                    log_file.write(f"Status:          {'SUCCESS' if returncode == 0 else 'FAILED'}\n")
+                    log_file.close()
+                    log_file = None
+                    print(f"✓ Log saved to: {log_path}")
+                except Exception as log_error:
+                    print(f"⚠ Warning: Could not save log file: {log_error}")
+
+            # Check for errors
+            if returncode != 0:
+                error_msg = redact_sensitive_text(capture.stderr_text() or "Unknown error")
+                print(f"❌ Upload failed: {cap_output(error_msg, 2000)}")
+                return False, output
+
+            print(f"✓ Upload completed successfully")
+            # Return success and output for database storage
+            return True, output
+
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            print(f"❌ Upload exception: {str(e)}")
+            print(f"Full traceback:\n{error_details}")
+
+            output = cap_output(redact_sensitive_text(f"Exception: {str(e)}\n\n{error_details}"))
+            if log_path:
+                try:
+                    if log_file is not None:
+                        log_file.close()
+                        log_file = None
+                    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                    with open(log_path, 'a', encoding='utf-8') as f:
+                        f.write("\n")
+                        write_log_header(f, "JETSTREAM UPLOAD JOB LOG - EXCEPTION")
+                        f.write(f"Status:          EXCEPTION\n")
+                        f.write("\n" + "="*80 + "\n")
+                        f.write("ERROR DETAILS\n")
+                        f.write("="*80 + "\n\n")
+                        f.write(output)
+                    print(f"✓ Error log saved to: {log_path}")
+                except Exception as log_error:
+                    print(f"⚠ Warning: Could not save error log: {log_error}")
+
+            if job_id in self.active_uploads:
+                del self.active_uploads[job_id]
+            return False, output
+        finally:
+            if log_file is not None:
+                try:
+                    log_file.close()
+                except Exception:
+                    pass
+
+    async def _upload_with_engine(self, job_id: str, source_path: str, gcs_path: str, dry_run: bool,
+                                  recursive: bool, log_path: Optional[str], exclude_patterns: List[str],
+                                  no_clobber: bool, progress_callback: Optional[Callable]) -> Tuple[bool, str]:
+        """Upload with the JetStream transfer engine (Rust), mapping its JSON events to job progress."""
+        engine = find_transfer_engine()
+        if not engine:
+            message = ("The JetStream upload engine is not installed. It ships with the JetStream desktop app; "
+                       "choose 'gcloud storage' as the upload tool instead.")
+            return False, message
+
+        from .transfer_settings import load as load_transfer_settings
+
+        cmd = [engine, "sync", source_path, gcs_path, "--control-stdin"]
+        transfer_settings = load_transfer_settings()
+        max_mbps = transfer_settings["max_mbps"]
+        if not transfer_settings["parallel_parts"]:
+            cmd.append("--no-composite")
+        if max_mbps > 0:
+            cmd.extend(["--max-mbps", f"{max_mbps:g}"])
+        if dry_run:
+            cmd.append("--dry-run")
+        if not recursive:
+            cmd.append("--no-recursive")
+        if no_clobber:
+            cmd.append("--no-clobber")
+        for pattern in exclude_patterns:
+            cmd.extend(["--exclude", pattern])
+        display_cmd = redact_sensitive_text(" ".join(f'"{c}"' if " " in c else c for c in cmd))
+        print(f"🚀 Executing: {display_cmd}")
+
+        log_file = None
+        if log_path:
+            try:
+                os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                log_file = open(log_path, 'w', encoding='utf-8')
+                log_file.write("=" * 80 + "\nJETSTREAM UPLOAD JOB LOG (JetStream engine)\n" + "=" * 80 + "\n\n")
+                log_file.write(f"Job ID:          {job_id}\n")
+                log_file.write(f"Timestamp:       {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                log_file.write(f"Source Path:     {source_path}\n")
+                log_file.write(f"Destination:     {gcs_path}\n")
+                log_file.write(f"Dry Run:         {dry_run}\n")
+                log_file.write(f"Command:         {display_cmd}\n\n")
+            except Exception as log_error:
+                print(f"⚠ Warning: Could not open log file: {log_error}")
+                log_file = None
+
+        capture = OutputCapture(log_file=log_file)
+        state = EngineRunState()
+        state.activity = start_job_activity(job_id, "jetstream")
+
+        def run_engine() -> int:
+            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            process = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                encoding="utf-8", errors="replace", bufsize=1, creationflags=creationflags,
+            )
+            self.active_uploads[job_id] = process
+            self.engine_jobs.add(job_id)
+
+            def _read_stderr():
+                for line in process.stderr:
+                    capture.add(line, "stderr")
+
+            reader = threading.Thread(target=_read_stderr, daemon=True)
+            reader.start()
+            for line in process.stdout:
+                capture.add(line, "stdout")
+                state.handle(line, progress_callback)
+            reader.join()
+            return process.wait()
+
+        try:
+            returncode = await asyncio.to_thread(run_engine)
+        except Exception as e:
+            returncode = None
+            state.error = f"Could not run the upload engine: {e}"
+        finally:
+            self.active_uploads.pop(job_id, None)
+            self.engine_jobs.discard(job_id)
+
+        # Raw JSON events stay in the log file; the job output is the readable summary.
+        stderr_tail = capture.stderr_text()
+        output = state.summary_text(returncode)
+        if stderr_tail:
+            output += "\n\nEngine messages:\n" + stderr_tail
+        output = cap_output(redact_sensitive_text(output))
+        if log_file is not None:
+            try:
+                log_file.write("\n" + "=" * 80 + "\n" + state.summary_text(returncode) + "\n")
+                log_file.close()
+            except Exception:
+                pass
+        success = returncode == 0
+        if state.summary is not None:
+            s = state.summary
+            self.upload_results[job_id] = {
+                "uploaded_files": int(s.get("would_upload" if dry_run else "uploaded") or 0),
+                "uploaded_bytes": int(s.get("would_upload_bytes" if dry_run else "uploaded_bytes") or 0),
+            }
+        print(("✓ " if success else "❌ ") + state.summary_text(returncode).splitlines()[0])
+        return success, output
+
+    def take_result(self, job_id: str, job) -> Dict[str, int]:
+        """What a finished upload actually sent (files and bytes), as opposed to the progress
+        counters (files_uploaded / bytes_uploaded count everything checked, so they read 100%).
+        The engine reports it; for gcloud it's the copies counted from its output."""
+        result = self.upload_results.pop(job_id, None)
+        if result is not None:
+            return result
+        return {"uploaded_files": int(job.files_uploaded or 0), "uploaded_bytes": int(job.bytes_uploaded or 0)}
+
+    def _send_engine_command(self, job_id: str, command: Dict) -> bool:
+        """Send a control command (pause, resume, limit) to a running engine job."""
+        import json
+
+        process = self.active_uploads.get(job_id)
+        if job_id not in self.engine_jobs or process is None or process.stdin is None:
+            return False
+        try:
+            process.stdin.write(json.dumps(command) + "\n")
+            process.stdin.flush()
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def pause_upload(self, job_id: str) -> bool:
+        """Pause a running engine upload (nothing new is sent until resumed)."""
+        ok = self._send_engine_command(job_id, {"cmd": "pause"})
+        activity = job_activity_object(job_id)
+        if ok and activity is not None:
+            activity.paused = True
+        return ok
+
+    def resume_upload(self, job_id: str) -> bool:
+        ok = self._send_engine_command(job_id, {"cmd": "resume"})
+        activity = job_activity_object(job_id)
+        if ok and activity is not None:
+            activity.paused = False
+        return ok
+
+    def apply_speed_limit(self, max_mbps: float) -> int:
+        """Change the bandwidth limit of every running engine upload; returns how many."""
+        return sum(self._send_engine_command(job_id, {"cmd": "limit", "mbps": max_mbps}) for job_id in list(self.engine_jobs))
+
+    def cancel_upload(self, job_id: str) -> bool:
+        """Cancel an active upload. Engine uploads stop gracefully (what's in flight finishes or is
+        saved, and the manifest is written) and are only killed if they don't exit in time."""
+        # Stops a file count that runs before the upload itself (see count_job_files).
+        self.stop_requested.add(job_id)
+        process = self.active_uploads.get(job_id)
+        if process is not None and self._send_engine_command(job_id, {"cmd": "stop"}):
+            def _kill_if_still_running():
+                try:
+                    process.wait(timeout=ENGINE_STOP_GRACE_SECONDS)
+                except subprocess.TimeoutExpired:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+            threading.Thread(target=_kill_if_still_running, daemon=True).start()
+            return True
+        if job_id in self.active_uploads:
+            try:
+                process = self.active_uploads[job_id]
+                process.kill()
+                del self.active_uploads[job_id]
+                return True
+            except:
+                return False
+        return False
+
+class QueueManager:
+    """Manage upload queue and concurrent jobs."""
+
+    def __init__(self, max_concurrent: int = 1):
+        self.max_concurrent = max_concurrent
+        self.running_jobs = set()
+        self.queue = []
+        self.paused = False
+
+    def can_start_job(self) -> bool:
+        """Check if a new job can be started (respects pause state)."""
+        return not self.paused and len(self.running_jobs) < self.max_concurrent
+
+    def pause(self) -> None:
+        """Pause queue — no new jobs will start until resume() is called."""
+        self.paused = True
+        logger.info("Queue paused")
+
+    def resume(self) -> None:
+        """Resume queue processing."""
+        self.paused = False
+        logger.info("Queue resumed")
+
+    def add_to_queue(self, job_id: str):
+        """Add job to queue."""
+        if job_id not in self.queue:
+            self.queue.append(job_id)
+
+    def start_job(self, job_id: str):
+        """Mark job as started."""
+        self.running_jobs.add(job_id)
+        if job_id in self.queue:
+            self.queue.remove(job_id)
+
+    def complete_job(self, job_id: str):
+        """Mark job as completed."""
+        if job_id in self.running_jobs:
+            self.running_jobs.remove(job_id)
+
+    def get_next_job(self) -> Optional[str]:
+        """Get next job from queue if can start."""
+        if self.can_start_job() and self.queue:
+            return self.queue[0]
+        return None
+
+    def get_queue_status(self) -> Dict:
+        """Get current queue status."""
+        return {
+            'running_count': len(self.running_jobs),
+            'queued_count': len(self.queue),
+            'running_jobs': list(self.running_jobs),
+            'queued_jobs': self.queue.copy(),
+            'max_concurrent': self.max_concurrent,
+            'paused': self.paused,
+        }
+
+_AUTH_CACHE_SECONDS = 30.0
+_auth_cache: Dict = {"at": 0.0, "value": None}
+_auth_lock = threading.Lock()
+
+
+def find_gcloud() -> Optional[str]:
+    """Full path to the gcloud CLI (gcloud.cmd on Windows), or None if not installed."""
+    return shutil.which("gcloud")
+
+
+def check_gcloud_auth(force: bool = False) -> Dict:
+    """Describe Google Cloud sign-in state for the UI and TUI.
+
+    Uploads run through the gcloud CLI account; bucket browsing and audits use
+    Application Default Credentials (ADC). ``gcloud auth login --update-adc`` sets both.
+    Results are cached briefly because ``google.auth.default`` and ``gcloud`` are slow.
+    """
+    with _auth_lock:
+        cached = _auth_cache["value"]
+        if not force and cached is not None and time.time() - _auth_cache["at"] < _AUTH_CACHE_SECONDS:
+            return dict(cached)
+
+    gcloud_path = find_gcloud()
+    result: Dict = {
+        "gcloud_installed": gcloud_path is not None,
+        "gcloud_account": None,
+        "adc_available": False,
+        "project": None,
+        "service_account": None,
+        "error": None,
+    }
+    try:
+        import google.auth
+        creds, project = google.auth.default()
+        result["adc_available"] = True
+        result["project"] = project
+        if hasattr(creds, "service_account_email"):
+            result["service_account"] = creds.service_account_email
+    except Exception as e:
+        result["error"] = redact_sensitive_text(str(e))
+
+    if gcloud_path:
+        try:
+            out = subprocess.check_output(
+                [gcloud_path, "auth", "list", "--filter=status:ACTIVE", "--format=value(account)"],
+                timeout=15,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            result["gcloud_account"] = out.strip().splitlines()[0] if out.strip() else None
+        except Exception:
+            pass
+
+    result["signed_in"] = bool(result["gcloud_account"] or result["adc_available"])
+    with _auth_lock:
+        _auth_cache["value"] = dict(result)
+        _auth_cache["at"] = time.time()
+    return result
+
+
+def clear_auth_cache() -> None:
+    with _auth_lock:
+        _auth_cache["value"] = None
+
+
+# Global instances
+upload_service = UploadService()
+def _initial_parallel_jobs() -> int:
+    try:
+        from .transfer_settings import load as load_transfer_settings
+
+        return load_transfer_settings()["parallel_jobs"]
+    except Exception:
+        return 1
+
+
+queue_manager = QueueManager(max_concurrent=_initial_parallel_jobs())

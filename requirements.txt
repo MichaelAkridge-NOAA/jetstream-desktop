@@ -1,0 +1,35 @@
+# NOAA JetStream Requirements
+
+# Web Framework
+fastapi>=0.109.0
+fastapi-cli>=0.0.20
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+
+# Database
+sqlalchemy>=2.0.25
+alembic>=1.13.0
+
+# Validation
+pydantic>=2.7.0
+pydantic-settings>=2.1.0
+
+# Google Cloud (required - core cloud upload features)
+google-cloud-storage>=2.14.0
+google-auth>=2.27.0
+google-auth-oauthlib>=1.2.0
+google-api-python-client>=2.0.2
+google-auth-httplib2>=0.2.0
+
+# Desktop Shortcuts (required)
+pyshortcuts>=1.9.0
+pywin32>=305; platform_system == "Windows"
+
+# Async support
+aiofiles>=23.2.0
+
+# System metrics (TUI host dashboard)
+psutil>=6.0.0
+
+# Environment
+python-dotenv>=1.0.0
