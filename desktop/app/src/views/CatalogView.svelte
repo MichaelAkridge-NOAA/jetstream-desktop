@@ -59,7 +59,7 @@
   let regrouping = $state(false);
   let gallery = $state(undefined); // group key, null for all files, undefined when closed
   let sortBy = $state('key');
-  let rowsShown = $state(100);
+  let rowsShown = $state(20);
   let dataset = $state(null);
   let sidecar = $state(true);
   let saveName = $state('');
@@ -171,7 +171,7 @@
     lastSent = JSON.stringify(grouping());
     try {
       summary = await catalogScan(opId, req, (t) => (tick = t));
-      rowsShown = 100;
+      rowsShown = 20;
       const b = summary.gcs_prefix.slice(5).split('/')[0];
       if (b) app.remember?.('recent_buckets', b);
     } catch (err) {
@@ -467,7 +467,7 @@
           </div>
           <button class="btn ghost sm" onclick={() => (gallery = null)}><Images size={14} /> Browse all files</button>
         </div>
-        <div class="groups" role="table">
+        <div class="groups" role="table" aria-label="Catalog groups" tabindex="0">
           <div class="tr th" role="row">
             {#if canSelect}<span role="columnheader" title="Untick to leave a group out of the catalog">In</span>{/if}
             <span role="columnheader">Group</span>
@@ -496,7 +496,7 @@
           {/each}
         </div>
         {#if rows.length > rowsShown}
-          <button class="btn ghost sm" onclick={() => (rowsShown += 200)}>Show more groups ({count(rows.length - rowsShown)} more)</button>
+          <button class="btn ghost sm" onclick={() => (rowsShown += 50)}>Show more groups ({count(rows.length - rowsShown)} more)</button>
         {/if}
         {#if summary.all_groups > summary.groups.length}
           <p class="muted small">Showing the first {count(summary.groups.length)} of {count(summary.all_groups)} groups; the catalog includes them all.</p>
@@ -720,10 +720,12 @@
     flex-direction: column;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
-    overflow: hidden;
+    max-height: min(320px, 40vh);
+    overflow: auto;
   }
   .tr {
     display: grid;
+    min-width: 700px;
     grid-template-columns: 32px minmax(160px, 1.4fr) 80px 90px 60px minmax(200px, 2fr);
     align-items: center;
     gap: 10px;
@@ -735,6 +737,9 @@
     grid-template-columns: minmax(160px, 1.4fr) 80px 90px 60px minmax(200px, 2fr);
   }
   .tr.th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
     border-top: none;
     background: var(--surface-2);
     font-size: 11.5px;
