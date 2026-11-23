@@ -467,7 +467,7 @@
           </div>
           <button class="btn ghost sm" onclick={() => (gallery = null)}><Images size={14} /> Browse all files</button>
         </div>
-        <div class="groups" role="table" aria-label="Catalog groups" tabindex="0">
+        <div class="groups" role="table" aria-label="Catalog groups">
           <div class="tr th" role="row">
             {#if canSelect}<span role="columnheader" title="Untick to leave a group out of the catalog">In</span>{/if}
             <span role="columnheader">Group</span>
