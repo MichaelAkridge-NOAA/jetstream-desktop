@@ -84,7 +84,7 @@ Older builds check the previous repository and may not see releases here. Downlo
 
 - **Installer:** run the new installer.
 - **macOS:** open the new disk image and replace JetStream in Applications.
-- **Portable:** unzip the new version, then move the **JetStreamData** folder from the old copy into it to keep your history.
+- **Portable:** unzip the new version, then quit JetStream from its tray icon before moving or copying **JetStreamData** from the old copy into the new folder. The update notice's **Show data folder** button locates it. Keep a backup of the old folder until the new app starts successfully.
 
 Back up your data before updating. Drafts and prereleases do not appear in the app's update check.
 

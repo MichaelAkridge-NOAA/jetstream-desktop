@@ -29,7 +29,7 @@ The standalone web version (`pip install` and `jetstream` in a browser) is descr
   - `jetstream-desktop-macos-latest-installers`: a macOS `.dmg` for the runner's architecture
 4. Unzip the artifact you downloaded (GitHub wraps every artifact in a ZIP). A portable artifact contains the portable ZIP, which you then unzip to run the app.
 
-**Updates:** once a day the app asks GitHub for the latest desktop release and, if it's newer, says so at the bottom of the sidebar and in **Settings → About** with a link to download it. Nothing is downloaded or installed on its own; turn the check off in **Settings → About**. To move a portable copy to a new version, unzip the new one and move the `JetStreamData` folder into it.
+**Updates:** once a day the app asks GitHub for the latest desktop release and, if it's newer, says so at the bottom of the sidebar and in **Settings → About** with a link to download it. Nothing is downloaded or installed on its own; turn the check off in **Settings → About**. To move a portable copy to a new version, unzip the new one, quit JetStream from the tray, and move or copy the `JetStreamData` folder into it. The update notice can show the data folder; keep a backup until the new app starts successfully.
 
 Windows and Linux portable copies with a known build number can also see a newer build of the same version when its matching portable ZIP is attached to a published release. Actions artifacts alone are not checked. Installed and macOS copies are notified about newer versions only; local builds without a build number cannot compare builds.
 

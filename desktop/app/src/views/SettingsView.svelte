@@ -2,13 +2,14 @@
   import LogIn from '@lucide/svelte/icons/log-in';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import ExternalLink from '@lucide/svelte/icons/external-link';
+  import FolderOpen from '@lucide/svelte/icons/folder-open';
   import Sun from '@lucide/svelte/icons/sun';
   import Moon from '@lucide/svelte/icons/moon';
   import Monitor from '@lucide/svelte/icons/monitor';
   import Gauge from '@lucide/svelte/icons/gauge';
   import { app, notifyLevel } from '../lib/state.svelte.js';
   import { api, apiBase } from '../lib/api.js';
-  import { clearThumbnailCache, ensureNotificationPermission, isDesktop, openClassic, openUrl, setThumbnailCacheLimit, thumbnailCacheInfo } from '../lib/platform.js';
+  import { clearThumbnailCache, ensureNotificationPermission, isDesktop, openClassic, openUrl, revealPath, setThumbnailCacheLimit, thumbnailCacheInfo } from '../lib/platform.js';
   import { bytes, count } from '../lib/format.js';
 
   const LIMITS = [[0, 'No limit'], [5, '5 Mbit/s'], [20, '20 Mbit/s'], [50, '50 Mbit/s'], [100, '100 Mbit/s']];
@@ -103,6 +104,22 @@
   function setUpdateCheck(on) {
     app.savePrefs({ update_check: on });
     app.scheduleUpdateChecks();
+  }
+
+  async function openUpdateLink(url) {
+    try {
+      await openUrl(url);
+    } catch (err) {
+      app.toast(`Couldn't open the download link: ${err?.message || err}`, 'error');
+    }
+  }
+
+  async function showPortableData() {
+    try {
+      await revealPath(app.desktop.portable_data);
+    } catch (err) {
+      app.toast(`Couldn't show the data folder: ${err?.message || err}`, 'error');
+    }
   }
 
   function setNotifyLevel(level) {
@@ -335,12 +352,15 @@
           {#if app.update}
             <p class="update-line">
               <strong>JetStream {app.update.latest}{app.update.build ? ` build ${app.update.build}` : ''} is available.</strong>
-              {app.desktop?.portable ? 'Unzip the new portable version, then move the JetStreamData folder from this copy into it to keep your job history.' : 'Download and run the new installer.'}
+              {app.desktop?.portable ? 'Unzip the new portable version. Quit JetStream from the tray before moving JetStreamData into the new folder to keep your history.' : 'Download and run the new installer.'}
             </p>
             <div class="btn-row">
-              <button class="btn primary" onclick={() => openUrl(app.update.url)}><ExternalLink size={15} /> Release page</button>
+              <button class="btn primary" onclick={() => openUpdateLink(app.update.url)}><ExternalLink size={15} /> Release page</button>
               {#if app.update.download}
-                <button class="btn" onclick={() => openUrl(app.update.download)}>Download portable zip</button>
+                <button class="btn" onclick={() => openUpdateLink(app.update.download)}>Download portable zip</button>
+              {/if}
+              {#if app.desktop?.portable_data}
+                <button class="btn" onclick={showPortableData}><FolderOpen size={15} /> Show data folder</button>
               {/if}
             </div>
           {:else if updateChecked}

@@ -101,7 +101,7 @@
   <div class="footer">
     {#if showUpdate}
       <div class="update">
-        <button class="update-open" onclick={() => openUrl(app.update.url)} title="Open the release page to download it">
+        <button class="update-open" onclick={() => openUrl(app.update.url).catch((err) => app.toast(`Couldn't open the release page: ${err?.message || err}`, 'error'))} title="Open the release page to download it">
           <ArrowUpCircle size={16} />
           <span>JetStream {app.update.latest}{app.update.build ? ` build ${app.update.build}` : ''} is available</span>
         </button>

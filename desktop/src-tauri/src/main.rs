@@ -122,16 +122,19 @@ struct AppInfo {
     commit: String,
     engine: String,
     portable: bool,
+    portable_data: Option<String>,
 }
 
 #[tauri::command]
 fn app_info(app: AppHandle) -> AppInfo {
+    let portable_data = portable_data_dir();
     AppInfo {
         version: app.package_info().version.to_string(),
         build: jetstream_transfer::BUILD_NUMBER.to_string(),
         commit: jetstream_transfer::COMMIT.to_string(),
         engine: jetstream_transfer::VERSION_TEXT.to_string(),
-        portable: portable_data_dir().is_some(),
+        portable: portable_data.is_some(),
+        portable_data: portable_data.map(|path| path.to_string_lossy().into_owned()),
     }
 }
 

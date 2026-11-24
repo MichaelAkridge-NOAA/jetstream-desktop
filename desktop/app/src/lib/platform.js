@@ -301,7 +301,7 @@ export async function setTransferLimit(maxMbps) {
   if (isDesktop) await invoke('set_transfer_limit', { maxMbps: Number(maxMbps) || 0 });
 }
 
-/** Desktop app and engine versions: { version, build, commit, engine, portable }; null in a browser. */
+/** Desktop app and engine versions: { version, build, commit, engine, portable, portable_data }; null in a browser. */
 export async function appInfo() {
   if (!isDesktop) return null;
   return invoke('app_info');
