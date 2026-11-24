@@ -7,6 +7,7 @@ The desktop app (with its bundled upload engine) has its own version, separate f
     desktop/transfer/Cargo.toml
 
     python desktop/scripts/set_version.py 0.2.1          # set it everywhere
+    python desktop/scripts/set_version.py --bump-patch   # increment the patch version
     python desktop/scripts/set_version.py --check        # fail if the files disagree
     python desktop/scripts/set_version.py --check --tag desktop-v0.2.1   # ...or don't match a tag
     python desktop/scripts/set_version.py --show         # print the version
@@ -66,15 +67,35 @@ def set_version(version: str) -> None:
     print(f"JetStream Desktop version set to {version} (Cargo.lock files update on the next build).")
 
 
+def next_patch(version: str) -> str:
+    if not VERSION_RE.fullmatch(version):
+        raise ValueError(f"Invalid desktop version: {version}")
+    major, minor, patch = (int(part) for part in version.split("."))
+    return f"{major}.{minor}.{patch + 1}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("version", nargs="?", help="new version, e.g. 0.2.1")
+    parser.add_argument("--bump-patch", action="store_true", help="increment the patch version")
     parser.add_argument("--check", action="store_true", help="fail if the files disagree")
     parser.add_argument("--tag", help="with --check: a release tag (desktop-vX.Y.Z) the version must match")
     parser.add_argument("--show", action="store_true", help="print the version")
     args = parser.parse_args()
 
-    if args.version:
+    if args.version and args.bump_patch:
+        parser.error("choose a version or --bump-patch, not both")
+    if args.bump_patch:
+        versions = set(current().values())
+        if len(versions) != 1:
+            print("Desktop version files disagree; fix them before bumping.", file=sys.stderr)
+            return 1
+        try:
+            set_version(next_patch(versions.pop()))
+        except ValueError as err:
+            print(err, file=sys.stderr)
+            return 1
+    elif args.version:
         set_version(args.version)
     found = current()
     versions = set(found.values())

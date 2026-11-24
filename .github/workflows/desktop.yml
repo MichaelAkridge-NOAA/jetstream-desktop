@@ -4,10 +4,10 @@ name: Build desktop app (Windows, macOS and Linux)
 # setup .exe installers), macOS (a .dmg), and Linux (a portable .zip plus .AppImage and .deb),
 # each uploaded as a workflow artifact. It runs on pushes
 # that change the app (any branch), by hand from the Actions tab, and on tags like
-# desktop-v0.2.0. Successful main builds for a new version also create a draft release.
+# desktop-v0.2.0. Main pushes bump the patch version and create a draft after successful builds.
 #
-# Versions: the desktop app has its own version (desktop/src-tauri/tauri.conf.json; change it
-# with desktop/scripts/set_version.py), separate from the Python package. Every build also
+# Versions: desktop/src-tauri/tauri.conf.json is the source of truth; set_version.py keeps the
+# other desktop version files in sync. The Python package is versioned separately. Every build also
 # carries its build number and commit (JETSTREAM_BUILD / JETSTREAM_COMMIT below), shown in the
 # app and in the portable zip's name: JetStream-0.2.0-build18-windows-x64-portable.zip.
 #
@@ -35,7 +35,56 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
+  prepare-release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      build_ref: ${{ steps.version.outputs.build_ref }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Bump desktop patch version
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch origin main
+          current=$(git rev-parse FETCH_HEAD)
+          if [ "$current" != "$GITHUB_SHA" ]; then
+            parent=$(git rev-parse "$current^" 2>/dev/null || true)
+            subject=$(git log -1 --format=%s "$current")
+            if [ "$parent" = "$GITHUB_SHA" ] && [[ "$subject" == 'Bump desktop version to '* ]]; then
+              echo "build_ref=$current" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "main advanced since this run started; refusing to overwrite newer changes." >&2
+            exit 1
+          fi
+          python desktop/scripts/set_version.py --bump-patch
+          version=$(python desktop/scripts/set_version.py --show)
+          tag="desktop-v${version}"
+          existing=$(git ls-remote --tags origin "refs/tags/$tag")
+          releases=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq '.[].tag_name')
+          if [ -n "$existing" ] || printf '%s\n' "$releases" | grep -Fxq "$tag"; then
+            echo "Tag or release $tag already exists; refusing to reuse its version." >&2
+            exit 1
+          fi
+          python desktop/scripts/release_notes.py "$version" --record-git
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add desktop/CHANGELOG.md desktop/package.json desktop/package-lock.json desktop/src-tauri/tauri.conf.json desktop/src-tauri/Cargo.toml desktop/transfer/Cargo.toml
+          git commit -m "Bump desktop version to $version"
+          git push origin HEAD:main
+          echo "build_ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: prepare-release
+    if: always() && !cancelled() && (needs.prepare-release.result == 'success' || needs.prepare-release.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:
@@ -48,9 +97,11 @@ jobs:
       contents: write
     env:
       JETSTREAM_BUILD: ${{ github.run_number }}
-      JETSTREAM_COMMIT: ${{ github.sha }}
+      JETSTREAM_COMMIT: ${{ needs.prepare-release.outputs.build_ref || github.sha }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare-release.outputs.build_ref || github.sha }}
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -156,8 +207,8 @@ jobs:
           files: desktop/release/*-portable.zip
 
   draft-release:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.prepare-release.result == 'success'
+    needs: [prepare-release, build]
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -167,6 +218,8 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare-release.outputs.build_ref }}
 
       - name: Prepare release
         id: release
@@ -200,4 +253,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
-        run: gh release create "$RELEASE_TAG" release-assets/* --draft --target "$GITHUB_SHA" --title "JetStream Desktop $RELEASE_TAG" --notes-file release-notes.md
+        run: gh release create "$RELEASE_TAG" release-assets/* --draft --target "${{ needs.prepare-release.outputs.build_ref }}" --title "JetStream Desktop $RELEASE_TAG" --notes-file release-notes.md
