@@ -3,6 +3,13 @@
 The desktop app has its own version, separate from the `jetstream` Python package.
 Each release's notes come from its section here (`## 0.2.0`, ...).
 
+## 0.2.2
+
+### Changes
+- Automate desktop patch bump and release prep
+- link update
+- Revise README for JetStream Desktop introduction
+
 ## 0.2.1
 
 ### Catalogs
