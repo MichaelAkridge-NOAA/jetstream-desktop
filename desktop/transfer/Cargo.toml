@@ -1,6 +1,6 @@
 [package]
 name = "jetstream-transfer"
-version = "0.2.3"
+version = "0.2.4"
 description = "JetStream upload engine: incremental folder sync to Google Cloud Storage with resumable, verified uploads"
 edition = "2021"
 publish = false
