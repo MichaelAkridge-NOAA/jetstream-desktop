@@ -9,6 +9,7 @@ Each release's notes come from its section here (`## 0.2.0`, ...).
 - Automate desktop patch bump and release prep
 - link update
 - Revise README for JetStream Desktop introduction
+- Match release-note version headings literally, including backslashes and other regular-expression metacharacters.
 
 ## 0.2.1
 

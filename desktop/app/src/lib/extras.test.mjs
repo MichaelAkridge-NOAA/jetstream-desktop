@@ -20,6 +20,18 @@ test('release notes from the changelog', () => {
   assert.ok(real && (real.intro || real.groups.some((group) => group.items.length)), 'CHANGELOG.md has notes for the current version');
 });
 
+test('release notes match regex metacharacters literally in version headings', () => {
+  for (const character of '.*+?^${}()|[]\\') {
+    const version = `0.3.0-${character}build`;
+    for (const prefix of ['', 'v']) {
+      const md = `## ${prefix}${version}\nExpected.\n\n## 0.2.0\nOld.\n`;
+      assert.deepEqual(releaseNotes(md, version), { version, intro: 'Expected.', groups: [] });
+    }
+  }
+  assert.equal(releaseNotes('## 0.3.0build\nWrong.\n', '0.3.0+build'), null);
+  assert.equal(releaseNotes('## 0x3x0\nWrong.\n', '0.3.0'), null);
+});
+
 test('milestones: quiet the first time, then the biggest new one of each kind', () => {
   const GB = 1024 ** 3;
   const first = checkMilestones({ bytes: 50 * GB, files: 5000 }, null);

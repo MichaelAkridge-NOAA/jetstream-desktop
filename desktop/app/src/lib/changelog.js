@@ -1,12 +1,16 @@
 // Release notes for "What's new", read from desktop/CHANGELOG.md (bundled with the app).
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /**
  * The `## <version>` section as { version, intro, groups: [{ title, items: [[{ text, bold }]] }] },
  * or null. Items are runs of plain and **bold** text (no HTML, so nothing is injected).
  */
 export function releaseNotes(markdown, version) {
   const lines = markdown.split(/\r?\n/);
-  const start = lines.findIndex((l) => new RegExp(`^##\\s+v?${version.replace(/\./g, '\\.')}\\s*$`).test(l));
+  const start = lines.findIndex((l) => new RegExp(`^##\\s+v?${escapeRegExp(version)}\\s*$`).test(l));
   if (start < 0) return null;
   const notes = { version, intro: '', groups: [] };
   let group = null;
