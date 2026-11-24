@@ -182,7 +182,7 @@ jobs:
         run: python desktop/scripts/build_desktop.py --package-only
 
       - name: Upload installers
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: jetstream-desktop-${{ matrix.platform }}-installers
           path: |
@@ -192,7 +192,7 @@ jobs:
 
       - name: Upload portable build
         if: runner.os != 'macOS'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: jetstream-desktop-${{ matrix.platform }}-portable
           path: desktop/release/*-portable.zip
@@ -242,7 +242,7 @@ jobs:
 
       - name: Download build artifacts
         if: steps.release.outputs.create == 'true'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           pattern: jetstream-desktop-*
           path: release-assets
