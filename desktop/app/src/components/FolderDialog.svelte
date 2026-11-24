@@ -48,7 +48,7 @@
 
   const QUICK_BUCKETS = ['nmfs_odp_pifsc', 'nmfs_odp_afsc', 'nmfs_odp_swfsc', 'nmfs_odp_sefsc', 'nmfs_odp_nefsc', 'nmfs_odp_nwfsc'];
   const FILTER_PRESETS = {
-    'Temp files': { patterns: ['*.tmp', '*.bak', '*.temp', '~*', '*.swp'] },
+    'Temp files': { patterns: ['*.tmp', '*.bak', '*.temp', '*.gstmp', '~*', '*.swp'] },
     'System files': { patterns: ['Thumbs.db', '.DS_Store', 'desktop.ini'], folders: ['__pycache__', '.git'] },
     'RAW photos': { patterns: ['*.CR2', '*.CR3', '*.NEF', '*.ARW', '*.DNG'] },
   };
